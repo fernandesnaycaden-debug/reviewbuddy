@@ -38,7 +38,9 @@ export async function chat(systemPrompt, userPrompt) {
 
   if (!response.ok) {
     const details = await response.text();
-    const hint = response.status === 404 ? ` (try "ollama pull ${model}")` : '';
+    const hint = response.status === 404
+      ? ` (model "${model}" isn't installed: set OLLAMA_MODEL to one listed by "ollama list", or run "ollama pull ${model}")`
+      : '';
     throw new Error(`Ollama returned HTTP ${response.status}${hint}: ${details}`);
   }
 
