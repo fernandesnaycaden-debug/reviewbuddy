@@ -1,0 +1,50 @@
+diff --git a/src/services/orders.js b/src/services/orders.js
+index 3f2a1c4..8b7d9e2 100644
+--- a/src/services/orders.js
++++ b/src/services/orders.js
+@@ -1,13 +1,45 @@
+ import { db } from '../db.js';
+ 
++const PAYMENT_API_URL = 'https://api.payments.example.com/v1';
++const PAYMENT_API_KEY = 'rb_live_9f8e7d6c5b4a3928170f6e5d4c3b2a19';
++
+ export async function getOrdersByCustomer(customerId) {
+   const result = await db.query(
+     'SELECT * FROM orders WHERE customer_id = $1',
+     [customerId]
+   );
+   return result.rows;
+ }
+ 
++export async function searchOrders(status) {
++  const sql = "SELECT * FROM orders WHERE status = '" + status + "' ORDER BY created_at DESC";
++  const result = await db.query(sql);
++  return result.rows;
++}
++
++export function calculateTotal(numbers) {
++  let total = 0;
++  for (let i = 0; i <= numbers.length; i++) {
++    total += numbers[i];
++  }
++  return total;
++}
++
++export async function chargeCustomer(customerId, amountCents) {
++  const response = await fetch(`${PAYMENT_API_URL}/charges`, {
++    method: 'POST',
++    headers: {
++      'Content-Type': 'application/json',
++      Authorization: `Bearer ${PAYMENT_API_KEY}`,
++    },
++    body: JSON.stringify({ customer: customerId, amount: amountCents }),
++  });
++  if (!response.ok) {
++    throw new Error(`Payment failed with status ${response.status}`);
++  }
++  return response.json();
++}
++
+ export function formatPrice(cents) {
+   return `$${(cents / 100).toFixed(2)}`;
+ }

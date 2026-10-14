@@ -1,0 +1,22 @@
+{
+  "name": "reviewbuddy",
+  "version": "1.0.0",
+  "description": "AI code reviewer for GitHub PRs. Runs on local models (Ollama) or free cloud APIs.",
+  "main": "src/index.js",
+  "scripts": {
+    "review": "node src/index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fernandesnaycaden-debug/reviewbuddy.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/fernandesnaycaden-debug/reviewbuddy/issues"
+  },
+  "homepage": "https://github.com/fernandesnaycaden-debug/reviewbuddy#readme"
+}
