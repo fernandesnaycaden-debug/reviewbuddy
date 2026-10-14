@@ -52,6 +52,49 @@ export function commentableLines(diff) {
   return new Set(annotateLines(diff).map((l) => l.newLine).filter(Boolean));
 }
 
+/** Line numbers (in the new file) of the added lines, the only ones the model may comment on. */
+export function addedLines(diff) {
+  return new Set(annotateLines(diff).filter((l) => l.newLine && l.text.startsWith('+')).map((l) => l.newLine));
+}
+
+/**
+ * Split a single-file diff into pieces of at most maxChars, cutting only between
+ * hunks, so a big file doesn't overflow the model's context window. Each piece keeps
+ * the file header, and line numbers stay right because every hunk header carries them.
+ * A single hunk bigger than maxChars becomes a piece of its own.
+ */
+export function chunkDiff(diff, maxChars) {
+  const lines = diff.trimEnd().split(/\r?\n/);
+  const firstHunk = lines.findIndex((line) => line.startsWith('@@ '));
+  if (firstHunk === -1) return [diff];
+
+  const header = lines.slice(0, firstHunk);
+  const hunks = [];
+  for (const line of lines.slice(firstHunk)) {
+    if (line.startsWith('@@ ')) hunks.push([]);
+    hunks.at(-1).push(line);
+  }
+
+  const chunks = [];
+  let current = [];
+  let size = 0;
+  for (const hunk of hunks) {
+    const hunkSize = hunk.join('\n').length;
+    if (current.length > 0 && size + hunkSize > maxChars) {
+      chunks.push(current);
+      current = [];
+      size = 0;
+    }
+    current.push(...hunk);
+    size += hunkSize;
+  }
+  chunks.push(current);
+
+  return chunks
+    .filter((chunk) => chunk.some((line) => line.startsWith('+')))
+    .map((chunk) => [...header, ...chunk].join('\n'));
+}
+
 /** Pair every line of a single-file diff with its new-file line number, or null if it has none. */
 function annotateLines(diff) {
   let newLine = 0;

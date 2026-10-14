@@ -1,15 +1,16 @@
 // Ollama provider: talks to a model running locally via the Ollama REST API.
-// Every provider in src/providers/ exports the same chat(systemPrompt, userPrompt)
+// Every provider in src/providers/ exports the same chat(systemPrompt, userPrompt, schema)
 // function, so the reviewer doesn't care which backend it is using.
 
 const DEFAULT_URL = 'http://localhost:11434';
-export const DEFAULT_MODEL ='qwen3.5:4b';
+export const DEFAULT_MODEL = 'qwen3.5:4b';
 
 /**
  * Send a system + user prompt to Ollama and return the model's reply as text.
- * The model is asked to answer in JSON, but parsing is left to the caller.
+ * If a JSON schema is given, Ollama constrains the reply to it; otherwise the
+ * reply is just some JSON. Parsing is left to the caller either way.
  */
-export async function chat(systemPrompt, userPrompt) {
+export async function chat(systemPrompt, userPrompt, schema) {
   const baseUrl = process.env.OLLAMA_URL || DEFAULT_URL;
   const model = process.env.OLLAMA_MODEL || DEFAULT_MODEL;
 
@@ -21,7 +22,7 @@ export async function chat(systemPrompt, userPrompt) {
       body: JSON.stringify({
         model,
         stream: false,
-        format: 'json',
+        format: schema ?? 'json',
         options: { temperature: 0.2, num_ctx: 8192 },
         messages: [
           { role: 'system', content: systemPrompt },

@@ -6,7 +6,7 @@ It reviews a GitHub pull request and posts its findings as inline review comment
 ## Requirements
 
 - [Node.js](https://nodejs.org/) 18 or newer (`node --version`)
-- [Ollama](https://ollama.com/) running locally, with at least one model pulled
+- [Ollama](https://ollama.com/) 0.5 or newer running locally, with at least one model pulled
 
 No `npm install` is needed: the project has no dependencies.
 
@@ -40,7 +40,16 @@ npm run review -- C:\path\to\your-project\changes.diff
 
 Use `--output=` rather than `git diff > changes.diff`: in Windows PowerShell 5.1, `>` writes UTF-16, which reviewbuddy can't read.
 
-Files with no added lines (deleted files, pure renames, binary files) are skipped.
+Files with no added lines (deleted files, pure renames, binary files) are skipped. So are files that aren't worth a model's time: lockfiles (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`), `*.min.*`, `*.map`, `*.snap`, `*.svg`, and anything under `dist/`, `build/`, `vendor/` or `node_modules/`.
+
+To skip more files, pass comma-separated patterns. A pattern ending in `/` matches a directory anywhere, a pattern without `/` matches a file name, and `*` matches anything except `/`:
+
+```powershell
+npm run review -- changes.diff --ignore "*.generated.ts,fixtures/"
+npm run review -- changes.diff --no-default-ignore   # review lockfiles, dist/ etc. too
+```
+
+Large files are reviewed in several parts so they fit in the model's context window.
 
 ## Review a GitHub pull request
 
@@ -77,6 +86,15 @@ Every run posts a new review; earlier ones are not updated or removed.
 | `OLLAMA_MODEL` | `qwen3.5:4b`             | Ollama model to use        |
 | `OLLAMA_URL`   | `http://localhost:11434` | Where Ollama is listening  |
 | `GITHUB_TOKEN` | none                     | Token used to read PRs and post reviews |
+| `REVIEWBUDDY_IGNORE` | none               | Extra comma-separated patterns to skip, like `--ignore` |
+
+## Tests
+
+```powershell
+npm test
+```
+
+The tests cover diff parsing, line numbering, chunking, the ignore list and reply parsing. They don't need Ollama.
 
 ## Expected output
 
