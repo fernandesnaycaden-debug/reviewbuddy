@@ -36,6 +36,16 @@ Rules:
 - Each added line is prefixed with its line number in the new file. Use that number for "line".
 - If there are no real problems, return an empty list.
 
+Security issues to watch for:
+- Hardcoded secrets, API keys, tokens, or passwords in source code.
+- SQL injection from string concatenation instead of parameterized queries.
+- Unsanitized user input used in commands, paths, or HTML.
+
+Bug patterns to watch for:
+- Off-by-one errors in loops (e.g. using <= instead of < with array.length).
+- Unhandled null/undefined values.
+- Incorrect error handling or swallowed exceptions.
+
 Reply with JSON only, in exactly this shape:
 {"comments": [{"line": <number>, "severity": "bug" | "security" | "performance" | "suggestion", "message": "<short explanation and fix>"}]}`;
 

@@ -1,4 +1,5 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { commentableLines, splitDiff } from './diff.js';
 import { getPullRequest, getPullRequestDiff, parsePrUrl, postReview } from './github.js';
@@ -11,6 +12,7 @@ const { values: flags, positionals } = parseArgs({
     'dry-run': { type: 'boolean', default: false },
     ignore: { type: 'string' },
     'no-default-ignore': { type: 'boolean', default: false },
+    output: { type: 'string', short: 'o' },
   },
   allowPositionals: true,
 });
@@ -119,11 +121,59 @@ async function reviewFiles(files) {
   const seconds = ((performance.now() - start) / 1000).toFixed(1);
   const total = results.reduce((sum, r) => sum + r.comments.length, 0);
   console.log(`${plural(total, 'issue')} in ${plural(files.length, 'file')}. Review took ${seconds}s`);
+
+  if (flags.output) {
+    await writeReport(results, seconds, flags.output);
+  }
   return results;
 }
 
 function plural(count, word) {
   return `${count} ${word}${count === 1 ? '' : 's'}`;
+}
+
+const SEVERITY_ICON = { security: '🔴', bug: '🟠', performance: '🟡', suggestion: '🔵' };
+
+async function writeReport(results, seconds, outputPath) {
+  const filePath = resolve(outputPath);
+  const model = process.env.OLLAMA_MODEL || DEFAULT_MODEL;
+  const total = results.reduce((sum, r) => sum + r.comments.length, 0);
+  const now = new Date().toLocaleString();
+
+  const lines = [
+    '# 🔍 ReviewBuddy Report',
+    '',
+    `> **${plural(total, 'issue')}** found across **${plural(results.length, 'file')}** in ${seconds}s`,
+    '',
+    '| Detail | Value |',
+    '|--------|-------|',
+    `| Model | \`${model}\` |`,
+    `| Date | ${now} |`,
+    `| Files reviewed | ${results.length} |`,
+    '',
+    '---',
+    '',
+  ];
+
+  for (const { filename, comments } of results) {
+    lines.push(`## \`${filename}\``);
+    lines.push('');
+    if (comments.length === 0) {
+      lines.push('_No issues found._');
+      lines.push('');
+      continue;
+    }
+    lines.push('| Line | Severity | Issue |');
+    lines.push('|------|----------|-------|');
+    for (const c of comments) {
+      const icon = SEVERITY_ICON[c.severity] || 'ℹ️';
+      lines.push(`| ${c.line} | ${icon} **${c.severity.toUpperCase()}** | ${c.message} |`);
+    }
+    lines.push('');
+  }
+
+  await writeFile(filePath, lines.join('\n'), 'utf8');
+  console.log(`\nReport written to ${filePath}`);
 }
 
 main().catch((err) => {
