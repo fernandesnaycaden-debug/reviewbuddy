@@ -1,7 +1,7 @@
 # reviewbuddy
 AI code reviewer for GitHub PRs. Runs on local models (Ollama) or free cloud APIs.
 
-Right now it reviews a single diff file and prints the findings. GitHub integration comes later.
+Right now it reviews a diff file (one or many changed files) and prints the findings. GitHub integration comes later.
 
 ## Requirements
 
@@ -25,6 +25,23 @@ npm run review
 
 To review a different diff: `npm run review -- path/to/file.diff`
 
+## Review your own changes
+
+Make a diff in the project you want reviewed, then point reviewbuddy at it. A diff can touch any number of files; each file is reviewed separately.
+
+```powershell
+cd C:\path\to\your-project
+git diff --output=changes.diff                 # uncommitted changes
+git diff main...my-branch --output=changes.diff  # everything on a branch
+
+cd C:\path\to\reviewbuddy
+npm run review -- C:\path\to\your-project\changes.diff
+```
+
+Use `--output=` rather than `git diff > changes.diff`: in Windows PowerShell 5.1, `>` writes UTF-16, which reviewbuddy can't read.
+
+Files with no added lines (deleted files, pure renames, binary files) are skipped.
+
 ## Configuration
 
 | Variable       | Default                  | Meaning                    |
@@ -45,13 +62,12 @@ The sample [samples/buggy.diff](samples/buggy.diff) contains three planted bugs:
 A good run looks roughly like this. The wording and timing depend on the model and the machine:
 
 ```
-Reviewing src/services/orders.js ...
+Reviewing src/services/orders.js (1/1) ...
+  src/services/orders.js:4 [SECURITY] Hardcoded API key; load it from an environment variable.
+  src/services/orders.js:15 [SECURITY] SQL injection from string concatenation; use a parameterized query.
+  src/services/orders.js:22 [BUG] Off-by-one; `<=` reads past the end of the array, so the total is NaN.
 
-[SECURITY] line 4: Hardcoded API key; load it from an environment variable.
-[SECURITY] line 15: SQL injection from string concatenation; use a parameterized query.
-[BUG] line 22: Off-by-one; `<=` reads past the end of the array, so the total is NaN.
-
-Review took 14.2s
+3 issues in 1 file. Review took 14.2s
 ```
 
 ## Troubleshooting

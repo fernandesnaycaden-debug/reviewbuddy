@@ -1,26 +1,35 @@
 import { readFile } from 'node:fs/promises';
+import { splitDiff } from './diff.js';
 import { reviewDiff } from './review.js';
 
 const diffPath = process.argv[2] || 'samples/buggy.diff';
 
 async function main() {
-  const diff = await readFile(diffPath, 'utf8');
+  const files = splitDiff(await readFile(diffPath, 'utf8'));
+  if (files.length === 0) {
+    console.log(`No added lines to review in ${diffPath}.`);
+    return;
+  }
 
-  // Use the file name from the "+++ b/path" header, falling back to the diff file name.
-  const filename = diff.match(/^\+\+\+ b\/(.+)$/m)?.[1]?.trim() || diffPath;
-
-  console.log(`Reviewing ${filename} ...\n`);
   const start = performance.now();
-  const comments = await reviewDiff(filename, diff);
-  const seconds = ((performance.now() - start) / 1000).toFixed(1);
+  let total = 0;
 
-  if (comments.length === 0) {
-    console.log('No issues found.');
+  for (const [i, file] of files.entries()) {
+    console.log(`Reviewing ${file.filename} (${i + 1}/${files.length}) ...`);
+    const comments = await reviewDiff(file.filename, file.diff);
+    total += comments.length;
+
+    for (const c of comments) {
+      console.log(`  ${file.filename}:${c.line} [${c.severity.toUpperCase()}] ${c.message}`);
+    }
+    if (comments.length === 0) console.log('  No issues found.');
+    console.log();
   }
-  for (const c of comments) {
-    console.log(`[${c.severity.toUpperCase()}] line ${c.line}: ${c.message}`);
-  }
-  console.log(`\nReview took ${seconds}s`);
+
+  const seconds = ((performance.now() - start) / 1000).toFixed(1);
+  const fileWord = files.length === 1 ? 'file' : 'files';
+  const issueWord = total === 1 ? 'issue' : 'issues';
+  console.log(`${total} ${issueWord} in ${files.length} ${fileWord}. Review took ${seconds}s`);
 }
 
 main().catch((err) => {
