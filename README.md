@@ -51,6 +51,17 @@ npm run review -- changes.diff --no-default-ignore   # review lockfiles, dist/ e
 
 Large files are reviewed in several parts so they fit in the model's context window.
 
+## Save the results to a file
+
+Add `--output` (or `-o`) to write a formatted Markdown report alongside the terminal output:
+
+```powershell
+npm run review -- --output review-report.md
+npm run review -- changes.diff -o report.md
+```
+
+The report includes a summary table, the model name, and per-file findings with severity badges. Every run overwrites the file.
+
 ## Review a GitHub pull request
 
 Pass the PR's URL instead of a diff file. reviewbuddy downloads the diff, reviews each file, and posts one review on the PR with a comment on each problem line.
