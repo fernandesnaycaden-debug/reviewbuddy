@@ -1,3 +1,4 @@
+import { numberDiffLines } from './diff.js';
 import { chat } from './providers/ollama.js';
 
 const SEVERITIES = ['bug', 'security', 'performance', 'suggestion'];
@@ -29,31 +30,6 @@ export async function reviewDiff(filename, diff) {
 
   console.warn('Warning: model returned invalid JSON twice, skipping this file.');
   return [];
-}
-
-/**
- * Small models are bad at counting lines inside a diff, so we do it for them:
- * every added or context line gets its line number in the new file.
- */
-function numberDiffLines(diff) {
-  let newLine = 0;
-  return diff
-    .trimEnd()
-    .split(/\r?\n/)
-    .map((line) => {
-      const hunk = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)/);
-      if (hunk) {
-        newLine = Number(hunk[1]);
-        return line;
-      }
-      if (line.startsWith('+++') || line.startsWith('---')) return line;
-      // An empty line is a blank context line whose leading space was stripped by an editor.
-      if (newLine > 0 && line === '') line = ' ';
-      if (line.startsWith('+') || line.startsWith(' ')) return `${String(newLine++).padStart(4)} ${line}`;
-      if (line.startsWith('-')) return `     ${line}`;
-      return line;
-    })
-    .join('\n');
 }
 
 /**

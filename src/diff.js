@@ -30,6 +30,48 @@ export function splitDiff(diff) {
     .map((section) => ({ filename: fileName(section), diff: section.join('\n') }));
 }
 
+/**
+ * Small models are bad at counting lines inside a diff, so we do it for them:
+ * every added or context line gets its line number in the new file.
+ */
+export function numberDiffLines(diff) {
+  return annotateLines(diff)
+    .map(({ text, newLine }) => {
+      if (newLine) return `${String(newLine).padStart(4)} ${text}`;
+      if (text.startsWith('-') && !text.startsWith('---')) return `     ${text}`;
+      return text;
+    })
+    .join('\n');
+}
+
+/**
+ * Line numbers (in the new file) that GitHub accepts inline comments on:
+ * the added and context lines inside the diff's hunks.
+ */
+export function commentableLines(diff) {
+  return new Set(annotateLines(diff).map((l) => l.newLine).filter(Boolean));
+}
+
+/** Pair every line of a single-file diff with its new-file line number, or null if it has none. */
+function annotateLines(diff) {
+  let newLine = 0;
+  return diff
+    .trimEnd()
+    .split(/\r?\n/)
+    .map((text) => {
+      const hunk = text.match(/^@@ -\d+(?:,\d+)? \+(\d+)/);
+      if (hunk) {
+        newLine = Number(hunk[1]);
+        return { text, newLine: null };
+      }
+      if (text.startsWith('+++') || text.startsWith('---')) return { text, newLine: null };
+      // An empty line is a blank context line whose leading space was stripped by an editor.
+      if (newLine > 0 && text === '') text = ' ';
+      if (newLine > 0 && (text.startsWith('+') || text.startsWith(' '))) return { text, newLine: newLine++ };
+      return { text, newLine: null };
+    });
+}
+
 /** Read the file path from the "+++ b/path" header, falling back to "diff --git a/x b/path". */
 function fileName(section) {
   const plus = section.find((line) => line.startsWith('+++ '));

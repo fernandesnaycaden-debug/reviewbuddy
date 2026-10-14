@@ -3,7 +3,7 @@
 // function, so the reviewer doesn't care which backend it is using.
 
 const DEFAULT_URL = 'http://localhost:11434';
-const DEFAULT_MODEL = 'qwen3.5:4b';
+export const DEFAULT_MODEL ='qwen3.5:4b';
 
 /**
  * Send a system + user prompt to Ollama and return the model's reply as text.

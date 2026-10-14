@@ -1,7 +1,7 @@
 # reviewbuddy
 AI code reviewer for GitHub PRs. Runs on local models (Ollama) or free cloud APIs.
 
-Right now it reviews a diff file (one or many changed files) and prints the findings. GitHub integration comes later.
+It reviews a GitHub pull request and posts its findings as inline review comments, or reviews a local diff file and prints them. Running automatically on every PR (a GitHub Action) comes later.
 
 ## Requirements
 
@@ -42,12 +42,41 @@ Use `--output=` rather than `git diff > changes.diff`: in Windows PowerShell 5.1
 
 Files with no added lines (deleted files, pure renames, binary files) are skipped.
 
+## Review a GitHub pull request
+
+Pass the PR's URL instead of a diff file. reviewbuddy downloads the diff, reviews each file, and posts one review on the PR with a comment on each problem line.
+
+First create a token at GitHub → Settings → Developer settings → [Fine-grained tokens](https://github.com/settings/personal-access-tokens/new):
+
+- **Repository access:** only the repos you want reviewed
+- **Permissions:** Pull requests → **Read and write**
+
+```powershell
+$env:GITHUB_TOKEN = "github_pat_..."
+npm run review -- https://github.com/owner/repo/pull/12
+```
+
+To see what would be posted without posting anything, add `--dry-run`. Public repos don't need a token for a dry run:
+
+```powershell
+npm run review -- https://github.com/owner/repo/pull/12 --dry-run
+```
+
+How the review looks on GitHub:
+
+- It is a plain comment review. reviewbuddy never approves a PR or requests changes.
+- Each finding is an inline comment like **[SECURITY]** Hardcoded API key; load it from an environment variable.
+- The review summary says how many issues were found and which model found them. Findings that point at a line outside the diff can't be attached to that line, so they are listed in the summary instead.
+
+Every run posts a new review; earlier ones are not updated or removed.
+
 ## Configuration
 
 | Variable       | Default                  | Meaning                    |
 |----------------|--------------------------|----------------------------|
 | `OLLAMA_MODEL` | `qwen3.5:4b`             | Ollama model to use        |
 | `OLLAMA_URL`   | `http://localhost:11434` | Where Ollama is listening  |
+| `GITHUB_TOKEN` | none                     | Token used to read PRs and post reviews |
 
 ## Expected output
 
@@ -78,3 +107,8 @@ Reviewing src/services/orders.js (1/1) ...
 | `Ollama returned HTTP 404 ... isn't installed` | `OLLAMA_MODEL` isn't set to a model you have. Check `ollama list`. |
 | `model returned invalid JSON` | The model replied with something that isn't JSON. It retries once; if it fails again, try a larger model. |
 | `Request to Ollama ... failed` after ~5 minutes | The model is too slow on this machine. Try a smaller model. |
+| `Set GITHUB_TOKEN to post a review` | Set `$env:GITHUB_TOKEN`, or add `--dry-run`. |
+| `GitHub returned HTTP 401` | The token is wrong or expired. Create a new one. |
+| `GitHub returned HTTP 403` | The token doesn't have Pull requests: Read and write on that repo. |
+| `GitHub returned HTTP 404` | Check the PR URL. For a private repo, the token must include that repo. |
+| `GitHub returned HTTP 406` | The PR is too large for GitHub's diff API. Review it locally with `git diff` instead. |
