@@ -145,6 +145,21 @@ test('groq falls back to JSON mode when the model rejects the schema, and rememb
   assert.equal(console.warn.mock.callCount(), 1);
 });
 
+test('groq returns a reply it rejected as invalid JSON, so the reviewer can retry, and keeps the schema', async () => {
+  process.env.GROQ_API_KEY = KEY;
+  const requests = mockFetch(
+    Response.json({ error: { message: 'Failed to validate JSON.', code: 'json_validate_failed', failed_generation: '{"comments": [' } }, { status: 400 }),
+    Response.json({ choices: [{ message: { content: REPLY } }] }),
+  );
+
+  assert.equal(await groq.chat('sys', 'user', SCHEMA), '{"comments": [');
+  assert.equal(await groq.chat('sys', 'user', SCHEMA), REPLY);
+
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].body.response_format.type, 'json_schema');
+  assert.match(console.warn.mock.calls[0].arguments[0], /Groq returned HTTP 400: Failed to validate JSON\./);
+});
+
 test('openrouter adds attribution headers and only routes to providers that honour the schema', async () => {
   process.env.OPENROUTER_API_KEY = KEY;
   const requests = mockFetch(Response.json({ choices: [{ message: { content: REPLY } }] }));

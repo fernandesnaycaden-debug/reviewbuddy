@@ -1,6 +1,8 @@
 // Shared client for APIs that speak OpenAI's chat completions format (Groq, OpenRouter).
 
-import { DEFAULT_TIMEOUT_MS, postJson, requireKey, withSchemaFallback } from './cloud.js';
+import {
+  DEFAULT_TIMEOUT_MS, InvalidReplyError, postJson, requireKey, withSchemaFallback,
+} from './cloud.js';
 
 /**
  * Build a provider for an OpenAI-compatible /chat/completions endpoint.
@@ -10,8 +12,21 @@ export function openAICompatible({ label, url, keyVar, keyUrl, modelVar, default
   const modelName = () => process.env[modelVar] || defaultModel;
   const checkConfig = () => requireKey(keyVar, label, keyUrl);
 
-  /** Send a system + user prompt and return the reply text, constrained to schema where the model allows. */
-  async function chat(systemPrompt, userPrompt, schema, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  /**
+   * Send a system + user prompt and return the reply text, constrained to schema where the model allows.
+   * A reply the API rejected as invalid JSON is returned as is; the reviewer retries it like any bad reply.
+   */
+  async function chat(systemPrompt, userPrompt, schema, options) {
+    try {
+      return await send(systemPrompt, userPrompt, schema, options);
+    } catch (err) {
+      if (!(err instanceof InvalidReplyError)) throw err;
+      console.warn(`Warning: ${err.message}`);
+      return err.output;
+    }
+  }
+
+  async function send(systemPrompt, userPrompt, schema, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
     const key = checkConfig();
     const model = modelName();
     const reply = await withSchemaFallback({ label, model }, schema, (schema) => postJson(url, {
