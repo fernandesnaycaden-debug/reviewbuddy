@@ -6,7 +6,9 @@ It reviews a GitHub pull request and posts its findings as inline review comment
 ## Requirements
 
 - [Node.js](https://nodejs.org/) 18 or newer (`node --version`)
-- [Ollama](https://ollama.com/) 0.5 or newer running locally, with at least one model pulled
+- One model provider, either:
+  - [Ollama](https://ollama.com/) 0.5 or newer running locally, with at least one model pulled (the default), or
+  - an API key for a cloud provider: Groq, OpenRouter, Gemini or Anthropic (see [Choose a provider](#choose-a-provider))
 
 No `npm install` is needed: the project has no dependencies.
 
@@ -33,6 +35,56 @@ npm run review
 `$env:OLLAMA_MODEL` only lasts for the current PowerShell window. On macOS/Linux use `OLLAMA_MODEL=qwen2.5-coder:7b npm run review`.
 
 To review a different diff: `npm run review -- path/to/file.diff`
+
+## Choose a provider
+
+reviewbuddy uses Ollama unless you pick another provider with `REVIEWBUDDY_PROVIDER` or `--provider` (the flag wins). Cloud providers need no local model, just an API key.
+
+| Provider | `--provider` | Free tier | Get a key |
+|----------|--------------|-----------|-----------|
+| Ollama (local) | `ollama` | Free, runs on your machine | No key needed |
+| Groq | `groq` | Yes, with per-minute and daily limits | [console.groq.com/keys](https://console.groq.com/keys) |
+| OpenRouter | `openrouter` | Yes, on free models (about 50 requests a day until you buy credits) | [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) |
+| Gemini | `gemini` | Yes, on Flash and Flash-Lite models | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
+| Anthropic (Claude) | `anthropic` | No, paid per token | [platform.claude.com/settings/keys](https://platform.claude.com/settings/keys) |
+
+Groq:
+
+```powershell
+$env:REVIEWBUDDY_PROVIDER = "groq"
+$env:GROQ_API_KEY = "gsk_..."
+npm run review
+```
+
+OpenRouter (the default model `openrouter/free` sends each request to one of the free models):
+
+```powershell
+$env:REVIEWBUDDY_PROVIDER = "openrouter"
+$env:OPENROUTER_API_KEY = "sk-or-..."
+npm run review
+```
+
+Gemini:
+
+```powershell
+$env:REVIEWBUDDY_PROVIDER = "gemini"
+$env:GEMINI_API_KEY = "..."
+npm run review
+```
+
+Anthropic:
+
+```powershell
+$env:REVIEWBUDDY_PROVIDER = "anthropic"
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
+npm run review
+```
+
+To switch provider for one run, use the flag: `npm run review -- changes.diff --provider gemini`. To use a different model, set that provider's `*_MODEL` variable (see [Configuration](#configuration)), for example `$env:GROQ_MODEL = "openai/gpt-oss-120b"`.
+
+Like `$env:OLLAMA_MODEL`, these only last for the current PowerShell window, so a key never ends up in a file. reviewbuddy never prints your key, even in error messages.
+
+reviewbuddy asks each provider for replies that match a JSON schema. If a model doesn't support that, it warns once and falls back to plain JSON mode.
 
 ## Review your own changes
 
@@ -103,15 +155,26 @@ Every run posts a new review; earlier ones are not updated or removed.
 
 | Variable       | Default                  | Meaning                    |
 |----------------|--------------------------|----------------------------|
+| `REVIEWBUDDY_PROVIDER` | `ollama`         | `ollama`, `groq`, `openrouter`, `gemini` or `anthropic`, like `--provider` |
 | `OLLAMA_MODEL` | `qwen3.5:4b`             | Ollama model to use        |
 | `OLLAMA_URL`   | `http://localhost:11434` | Where Ollama is listening  |
+| `GROQ_API_KEY` | none                     | Groq API key               |
+| `GROQ_MODEL`   | `openai/gpt-oss-20b`     | Groq model to use          |
+| `OPENROUTER_API_KEY` | none               | OpenRouter API key         |
+| `OPENROUTER_MODEL` | `openrouter/free`    | OpenRouter model to use    |
+| `GEMINI_API_KEY` | none                   | Gemini API key             |
+| `GEMINI_MODEL` | `gemini-3.8-flash`       | Gemini model to use        |
+| `ANTHROPIC_API_KEY` | none                | Anthropic API key          |
+| `ANTHROPIC_MODEL` | `claude-opus-5-5`     | Claude model to use        |
 | `GITHUB_TOKEN` | none                     | Token used to read PRs and post reviews |
 | `REVIEWBUDDY_IGNORE` | none               | Extra comma-separated patterns to skip, like `--ignore` |
-| `REVIEWBUDDY_TIMEOUT` | `600`             | Seconds a single model request may take, like `--timeout`. `0` means no limit |
+| `REVIEWBUDDY_TIMEOUT` | `600` (Ollama), `300` (cloud) | Seconds a single model request may take, like `--timeout`. `0` means no limit |
 
 Pass `--timeout <seconds>` to override `REVIEWBUDDY_TIMEOUT` for one run, for example `npm run review -- changes.diff --timeout 1200` for a slow model.
 
-Network errors and HTTP 429/5xx responses from GitHub and Ollama are retried up to 3 times with backoff (1s, 2s, 4s, or whatever `Retry-After` asks for). Posting the review is only retried after a 429, so a PR never gets the same review twice. GitHub requests time out after 30 seconds.
+With the default Claude models (Opus 5.5, Sonnet 5.5, Opus 5, Fable 5.1), reviewbuddy turns on Anthropic's server-side refusal fallback. If a safety classifier declines to review a piece of code, another Claude model finishes the request. A piece that is still declined, or that Gemini blocks, is skipped with a warning.
+
+Network errors and HTTP 429/5xx responses from GitHub, Ollama and the cloud providers are retried up to 3 times with backoff (1s, 2s, 4s, or whatever `Retry-After` asks for). Posting the review is only retried after a 429, so a PR never gets the same review twice. GitHub requests time out after 30 seconds.
 
 ## Tests
 
@@ -119,7 +182,7 @@ Network errors and HTTP 429/5xx responses from GitHub and Ollama are retried up 
 npm test
 ```
 
-The tests cover diff parsing, line numbering, chunking, the ignore list, reply parsing, retries and timeouts, the GitHub client, splitting findings between inline comments and the review body, the Markdown report, and a full run with GitHub and Ollama mocked. They need neither Ollama nor network access.
+The tests cover diff parsing, line numbering, chunking, the ignore list, reply parsing, retries and timeouts, the GitHub client, splitting findings between inline comments and the review body, the Markdown report, a full run with GitHub and Ollama mocked, and each cloud provider's requests, replies and errors (provider selection, missing keys, schema fallback, 401/404/429). They need neither Ollama, API keys nor network access.
 
 ## Expected output
 
@@ -150,6 +213,14 @@ Reviewing src/services/orders.js (1/1) ...
 | `model returned invalid JSON` | The model replied with something that isn't JSON. It retries once; if it fails again, try a larger model. |
 | `Ollama didn't finish within 600s` | The model is too slow on this machine. Try a smaller model, or raise `--timeout`. |
 | `... retrying in 2.0s (1/3)` | A network error or a busy server. reviewbuddy retries on its own; it only fails if every retry does. |
+| `Unknown provider "..."` | Use one of `ollama`, `groq`, `openrouter`, `gemini`, `anthropic` in `--provider` or `REVIEWBUDDY_PROVIDER`. |
+| `Set GROQ_API_KEY to use Groq` (or another `*_API_KEY`) | The provider you picked needs a key. Set it with `$env:GROQ_API_KEY = "..."`, or pick another provider. |
+| `Groq returned HTTP 401 (Groq rejected the API key ...)` | The key is wrong, expired or revoked (also shown for HTTP 403). Create a new one. |
+| `... returned HTTP 404 (model "..." not found ...)` | The `*_MODEL` variable names a model that provider doesn't offer. Unset it to use the default, or check the provider's model list. |
+| `... returned HTTP 429 (rate limited ...)` | You hit the free tier's per-minute or daily limit. reviewbuddy already retried. Wait, review a smaller diff, or switch provider. |
+| `OpenRouter returned HTTP 402` | Your OpenRouter balance is used up. Add credits, or use a free model. |
+| `... didn't reply within 300s` | The cloud model is slow or overloaded. Raise `--timeout`, or pick a faster model. |
+| `Retrying without the JSON schema, in plain JSON mode` | Only a warning: the model doesn't support structured output, so reviewbuddy uses plain JSON mode for it. |
 | `Set GITHUB_TOKEN to post a review` | Set `$env:GITHUB_TOKEN`, or add `--dry-run`. |
 | `GitHub returned HTTP 401` | The token is wrong or expired. Create a new one. |
 | `GitHub returned HTTP 403` | The token doesn't have Pull requests: Read and write on that repo. |

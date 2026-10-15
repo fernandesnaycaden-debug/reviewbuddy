@@ -8,6 +8,10 @@ const DEFAULT_URL = 'http://localhost:11434';
 export const DEFAULT_MODEL = 'qwen3.5:4b';
 export const DEFAULT_TIMEOUT_MS = 600_000;
 
+export function modelName() {
+  return process.env.OLLAMA_MODEL || DEFAULT_MODEL;
+}
+
 /**
  * Send a system + user prompt to Ollama and return the model's reply as text.
  * If a JSON schema is given, Ollama constrains the reply to it; otherwise the
@@ -19,7 +23,7 @@ export const DEFAULT_TIMEOUT_MS = 600_000;
  */
 export async function chat(systemPrompt, userPrompt, schema, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   const baseUrl = process.env.OLLAMA_URL || DEFAULT_URL;
-  const model = process.env.OLLAMA_MODEL || DEFAULT_MODEL;
+  const model = modelName();
 
   try {
     const response = await fetchWithRetry(`${baseUrl}/api/chat`, {

@@ -57,6 +57,13 @@ test('buildReview says when nothing was found', () => {
   assert.equal(review.body, 'reviewbuddy found no issues in 1 file (model `m`).');
 });
 
+test('buildReview and formatReport name the provider when given one', () => {
+  const review = buildReview([{ filename: 'src/a.js', diff, comments: [] }], { commitId: 'abc', model: 'm', provider: 'groq' });
+  assert.equal(review.body, 'reviewbuddy found no issues in 1 file (model `m` via groq).');
+  const report = formatReport(results, { model: 'm', provider: 'groq', seconds: '1.5', date: new Date(0) });
+  assert.match(report, /\| Provider \| groq \|\n\| Model \| `m` \|/);
+});
+
 test('formatReport renders a summary and a table per file', () => {
   const report = formatReport(results, { model: 'm', seconds: '1.5', date: new Date(0) });
   assert.match(report, /^# 🔍 ReviewBuddy Report\n/);
@@ -93,6 +100,8 @@ function ollamaReply(comments) {
 }
 
 function withEnv(vars, fn) {
+  // Keep a provider set in the developer's shell from leaking in.
+  vars = { REVIEWBUDDY_PROVIDER: '', ...vars };
   const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
   Object.assign(process.env, vars);
   return fn().finally(() => {

@@ -1,9 +1,10 @@
 import { addedLines, chunkDiff, numberDiffLines } from './diff.js';
-import { chat } from './providers/ollama.js';
+import { chat } from './providers/index.js';
 
 const SEVERITIES = ['bug', 'security', 'performance', 'suggestion'];
 
-// Ollama constrains the reply to this schema, so the model can't answer in the wrong shape.
+// The provider constrains the reply to this schema, so the model can't answer in the wrong shape.
+// Strict modes (Anthropic, Groq) need every property required and additionalProperties: false.
 const COMMENTS_SCHEMA = {
   type: 'object',
   properties: {
@@ -17,10 +18,12 @@ const COMMENTS_SCHEMA = {
           message: { type: 'string' },
         },
         required: ['line', 'severity', 'message'],
+        additionalProperties: false,
       },
     },
   },
   required: ['comments'],
+  additionalProperties: false,
 };
 
 // The context window is 8192 tokens. Code averages about 3 characters per token, and
