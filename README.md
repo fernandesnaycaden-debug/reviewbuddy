@@ -110,7 +110,7 @@ The tests cover diff parsing, line numbering, chunking, the ignore list and repl
 ## Expected output
 
 The sample [samples/buggy.diff](samples/buggy.diff) contains three planted bugs:
-
+Adding a bin entry for installation 
 | Line | Bug |
 |------|-----|
 | 4    | Hardcoded API key |
