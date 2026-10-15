@@ -1,0 +1,2 @@
+# The shebang line breaks on Unix with CRLF line endings.
+bin/* text eol=lf

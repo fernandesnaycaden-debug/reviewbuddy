@@ -1,5 +1,6 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { commentableLines, splitDiff } from './diff.js';
 import { getPullRequest, getPullRequestDiff, parsePrUrl, postReview } from './github.js';
@@ -7,56 +8,90 @@ import { DEFAULT_IGNORE, isIgnored, parsePatterns } from './ignore.js';
 import { DEFAULT_MODEL } from './providers/ollama.js';
 import { reviewDiff } from './review.js';
 
-const { values: flags, positionals } = parseArgs({
-  options: {
-    'dry-run': { type: 'boolean', default: false },
-    ignore: { type: 'string' },
-    'no-default-ignore': { type: 'boolean', default: false },
-    output: { type: 'string', short: 'o' },
-  },
-  allowPositionals: true,
-});
-const target = positionals[0] || 'samples/buggy.diff';
-const ignorePatterns = [
-  ...(flags['no-default-ignore'] ? [] : DEFAULT_IGNORE),
-  ...parsePatterns(process.env.REVIEWBUDDY_IGNORE),
-  ...parsePatterns(flags.ignore),
-];
+const SAMPLE_DIFF = fileURLToPath(new URL('../samples/buggy.diff', import.meta.url));
 
-async function main() {
+/** Run the CLI with the given arguments (process.argv without node and the script). */
+export async function main(argv) {
+  const { values: flags, positionals } = parseArgs({
+    args: argv,
+    options: {
+      'dry-run': { type: 'boolean', default: false },
+      ignore: { type: 'string' },
+      'no-default-ignore': { type: 'boolean', default: false },
+      output: { type: 'string', short: 'o' },
+      timeout: { type: 'string' },
+    },
+    allowPositionals: true,
+  });
+
+  const options = {
+    dryRun: flags['dry-run'],
+    output: flags.output,
+    timeoutMs: parseTimeout(flags.timeout ?? process.env.REVIEWBUDDY_TIMEOUT),
+    ignorePatterns: [
+      ...(flags['no-default-ignore'] ? [] : DEFAULT_IGNORE),
+      ...parsePatterns(process.env.REVIEWBUDDY_IGNORE),
+      ...parsePatterns(flags.ignore),
+    ],
+  };
+
+  const target = positionals[0] || SAMPLE_DIFF;
   const pr = parsePrUrl(target);
   if (pr) {
-    await reviewPullRequest(pr);
+    await reviewPullRequest(pr, options);
   } else {
-    await reviewDiffFile(target);
+    await reviewDiffFile(target, options);
   }
 }
 
-async function reviewDiffFile(diffPath) {
-  const files = reviewable(splitDiff(await readFile(diffPath, 'utf8')));
+/** Seconds from --timeout or REVIEWBUDDY_TIMEOUT, in milliseconds. undefined = the default. */
+function parseTimeout(value) {
+  if (value === undefined || value === '') return undefined;
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    throw new Error(`Invalid timeout "${value}": give a number of seconds, or 0 for no limit.`);
+  }
+  return seconds * 1000;
+}
+
+async function reviewDiffFile(diffPath, options) {
+  const files = reviewable(splitDiff(await readFile(diffPath, 'utf8')), options);
   if (files.length === 0) {
     console.log(`Nothing to review in ${diffPath}.`);
     return;
   }
-  await reviewFiles(files);
+  await reviewFiles(files, options);
 }
 
-async function reviewPullRequest(pr) {
+async function reviewPullRequest(pr, options) {
   const token = process.env.GITHUB_TOKEN;
-  const dryRun = flags['dry-run'];
   // Fail now rather than after several minutes of model calls.
-  if (!token && !dryRun) {
+  if (!token && !options.dryRun) {
     throw new Error('Set GITHUB_TOKEN to post a review, or pass --dry-run to only print it.');
   }
 
   const { head } = await getPullRequest(pr, token);
-  const files = reviewable(splitDiff(await getPullRequestDiff(pr, token)));
+  const files = reviewable(splitDiff(await getPullRequestDiff(pr, token)), options);
   console.log(`Pull request ${pr.owner}/${pr.repo}#${pr.number}: ${files.length} file(s) to review\n`);
 
-  const results = files.length > 0 ? await reviewFiles(files) : [];
+  const results = files.length > 0 ? await reviewFiles(files, options) : [];
+  const review = buildReview(results, { commitId: head.sha, model: modelName() });
 
-  // GitHub rejects the whole review if a comment points outside the diff,
-  // so findings on other lines go into the review body instead.
+  if (options.dryRun) {
+    console.log('Dry run, not posting. The review would be:\n');
+    console.log(JSON.stringify(review, null, 2));
+    return;
+  }
+  const posted = await postReview(pr, token, review);
+  console.log(`Posted review: ${posted.html_url}`);
+}
+
+/**
+ * Turn review results into the { commitId, body, comments } posted to GitHub.
+ * GitHub rejects the whole review if a comment points outside the diff,
+ * so findings on other lines go into the review body instead.
+ */
+export function buildReview(results, { commitId, model }) {
   const comments = [];
   const leftovers = [];
   for (const { filename, diff, comments: found } of results) {
@@ -67,20 +102,11 @@ async function reviewPullRequest(pr) {
       else leftovers.push(`- \`${filename}:${c.line}\` ${body}`);
     }
   }
-
-  const review = { commitId: head.sha, body: reviewBody(results, leftovers), comments };
-
-  if (dryRun) {
-    console.log('Dry run, not posting. The review would be:\n');
-    console.log(JSON.stringify(review, null, 2));
-    return;
-  }
-  const posted = await postReview(pr, token, review);
-  console.log(`Posted review: ${posted.html_url}`);
+  return { commitId, body: reviewBody(results, leftovers, model), comments };
 }
 
 /** Leave out lockfiles, generated files and anything else on the ignore list. */
-function reviewable(files) {
+function reviewable(files, { ignorePatterns }) {
   const kept = files.filter((f) => !isIgnored(f.filename, ignorePatterns));
   const skipped = files.filter((f) => !kept.includes(f));
   if (skipped.length > 0) {
@@ -89,9 +115,8 @@ function reviewable(files) {
   return kept;
 }
 
-function reviewBody(results, leftovers) {
-  const total = results.reduce((sum, r) => sum + r.comments.length, 0);
-  const model = process.env.OLLAMA_MODEL || DEFAULT_MODEL;
+function reviewBody(results, leftovers, model) {
+  const total = countIssues(results);
   const lines = [total === 0
     ? `reviewbuddy found no issues in ${plural(results.length, 'file')} (model \`${model}\`).`
     : `reviewbuddy found ${plural(total, 'issue')} in ${plural(results.length, 'file')} (model \`${model}\`).`];
@@ -102,13 +127,13 @@ function reviewBody(results, leftovers) {
 }
 
 /** Review each file, print the findings, and return [{ filename, diff, comments }]. */
-async function reviewFiles(files) {
+async function reviewFiles(files, { output, timeoutMs }) {
   const start = performance.now();
   const results = [];
 
   for (const [i, file] of files.entries()) {
     console.log(`Reviewing ${file.filename} (${i + 1}/${files.length}) ...`);
-    const comments = await reviewDiff(file.filename, file.diff);
+    const comments = await reviewDiff(file.filename, file.diff, { timeoutMs });
     results.push({ ...file, comments });
 
     for (const c of comments) {
@@ -119,13 +144,21 @@ async function reviewFiles(files) {
   }
 
   const seconds = ((performance.now() - start) / 1000).toFixed(1);
-  const total = results.reduce((sum, r) => sum + r.comments.length, 0);
-  console.log(`${plural(total, 'issue')} in ${plural(files.length, 'file')}. Review took ${seconds}s`);
+  console.log(`${plural(countIssues(results), 'issue')} in ${plural(files.length, 'file')}. Review took ${seconds}s`);
 
-  if (flags.output) {
-    await writeReport(results, seconds, flags.output);
+  if (output) {
+    const filePath = await writeReport(results, { seconds, outputPath: output });
+    console.log(`\nReport written to ${filePath}`);
   }
   return results;
+}
+
+function modelName() {
+  return process.env.OLLAMA_MODEL || DEFAULT_MODEL;
+}
+
+function countIssues(results) {
+  return results.reduce((sum, r) => sum + r.comments.length, 0);
 }
 
 function plural(count, word) {
@@ -134,12 +167,9 @@ function plural(count, word) {
 
 const SEVERITY_ICON = { security: '🔴', bug: '🟠', performance: '🟡', suggestion: '🔵' };
 
-async function writeReport(results, seconds, outputPath) {
-  const filePath = resolve(outputPath);
-  const model = process.env.OLLAMA_MODEL || DEFAULT_MODEL;
-  const total = results.reduce((sum, r) => sum + r.comments.length, 0);
-  const now = new Date().toLocaleString();
-
+/** Render review results as a Markdown report. */
+export function formatReport(results, { model, seconds, date }) {
+  const total = countIssues(results);
   const lines = [
     '# 🔍 ReviewBuddy Report',
     '',
@@ -148,7 +178,7 @@ async function writeReport(results, seconds, outputPath) {
     '| Detail | Value |',
     '|--------|-------|',
     `| Model | \`${model}\` |`,
-    `| Date | ${now} |`,
+    `| Date | ${date.toLocaleString()} |`,
     `| Files reviewed | ${results.length} |`,
     '',
     '---',
@@ -171,13 +201,12 @@ async function writeReport(results, seconds, outputPath) {
     }
     lines.push('');
   }
-
-  await writeFile(filePath, lines.join('\n'), 'utf8');
-  console.log(`\nReport written to ${filePath}`);
+  return lines.join('\n');
 }
 
-main().catch((err) => {
-  console.error(`Error: ${err.message}`);
-  // Not process.exit(): exiting while fetch sockets close crashes Node on Windows.
-  process.exitCode = 1;
-});
+/** Write the Markdown report to outputPath and return its absolute path. */
+export async function writeReport(results, { seconds, outputPath, model = modelName(), date = new Date() }) {
+  const filePath = resolve(outputPath);
+  await writeFile(filePath, formatReport(results, { model, seconds, date }), 'utf8');
+  return filePath;
+}
