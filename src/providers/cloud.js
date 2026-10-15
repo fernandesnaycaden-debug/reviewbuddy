@@ -5,10 +5,12 @@ import { fetchWithRetry } from '../http.js';
 
 export const DEFAULT_TIMEOUT_MS = 300_000;
 
-/** Return the API key in keyVar, or explain where to get one. */
+/** Return the API key in keyVar, or explain where to get one. The error has code MISSING_API_KEY. */
 export function requireKey(keyVar, label, keyUrl) {
   const key = process.env[keyVar];
-  if (!key) throw new Error(`Set ${keyVar} to use ${label}. Get a key at ${keyUrl}`);
+  if (!key) {
+    throw Object.assign(new Error(`Set ${keyVar} to use ${label}. Get a key at ${keyUrl}`), { code: 'MISSING_API_KEY' });
+  }
   return key;
 }
 

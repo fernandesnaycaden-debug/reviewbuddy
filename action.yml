@@ -1,0 +1,82 @@
+name: reviewbuddy
+description: AI code review on every pull request, posted as inline comments. Can fail the check on chosen severities.
+author: fernandesnaycaden-debug
+branding:
+  icon: eye
+  color: blue
+
+inputs:
+  github-token:
+    description: Token used to read the pull request and post the review. Needs pull-requests write permission.
+    default: ${{ github.token }}
+  provider:
+    description: Model provider, one of groq, openrouter, gemini, anthropic (ollama only with OLLAMA_URL set).
+    required: true
+  model:
+    description: Model name for the chosen provider. Empty uses reviewbuddy's default for that provider.
+    default: ''
+  api-key:
+    description: API key for the chosen provider. Pass it from a secret, e.g. secrets.GROQ_API_KEY.
+    default: ''
+  fail-on:
+    description: Comma-separated severities that fail the check (bug, security, performance, suggestion). Empty never fails on findings.
+    default: ''
+  ignore:
+    description: Extra comma-separated file patterns to skip, like --ignore.
+    default: ''
+  full:
+    description: Review the whole PR instead of only the commits since the last reviewbuddy review.
+    default: 'false'
+  timeout:
+    description: Seconds a single model request may take (0 = no limit). Empty uses the default.
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    - name: Review pull request
+      shell: bash
+      # Inputs reach the script only as environment variables, never interpolated into it,
+      # so a crafted value can't inject shell commands.
+      env:
+        PR_URL: ${{ github.event.pull_request.html_url }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_PROVIDER: ${{ inputs.provider }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_API_KEY: ${{ inputs.api-key }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_IGNORE: ${{ inputs.ignore }}
+        INPUT_FULL: ${{ inputs.full }}
+        INPUT_TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        if [ "$GITHUB_EVENT_NAME" != "pull_request" ] || [ -z "$PR_URL" ]; then
+          echo "::error::reviewbuddy runs on pull_request events (this run is \"$GITHUB_EVENT_NAME\"). Trigger the workflow with on: pull_request."
+          exit 1
+        fi
+
+        export GITHUB_TOKEN="$INPUT_GITHUB_TOKEN"
+        export REVIEWBUDDY_PROVIDER="$INPUT_PROVIDER"
+        export REVIEWBUDDY_FAIL_ON="$INPUT_FAIL_ON"
+        export REVIEWBUDDY_IGNORE="$INPUT_IGNORE"
+        export REVIEWBUDDY_TIMEOUT="$INPUT_TIMEOUT"
+
+        # Each provider reads its own key and model variables.
+        case "$(echo "$INPUT_PROVIDER" | tr '[:upper:]' '[:lower:]')" in
+          groq)       key_var=GROQ_API_KEY;       model_var=GROQ_MODEL ;;
+          openrouter) key_var=OPENROUTER_API_KEY; model_var=OPENROUTER_MODEL ;;
+          gemini)     key_var=GEMINI_API_KEY;     model_var=GEMINI_MODEL ;;
+          anthropic)  key_var=ANTHROPIC_API_KEY;  model_var=ANTHROPIC_MODEL ;;
+          ollama|'')  key_var='';                 model_var=OLLAMA_MODEL ;;
+          *)          key_var='';                 model_var='' ;;  # reviewbuddy reports the unknown provider
+        esac
+        if [ -n "$key_var" ] && [ -n "$INPUT_API_KEY" ]; then export "$key_var=$INPUT_API_KEY"; fi
+        if [ -n "$model_var" ] && [ -n "$INPUT_MODEL" ]; then export "$model_var=$INPUT_MODEL"; fi
+
+        args=()
+        if [ "$INPUT_FULL" = "true" ]; then args+=(--full); fi
+
+        node "$GITHUB_ACTION_PATH/bin/reviewbuddy.js" "$PR_URL" "${args[@]}"

@@ -1,7 +1,7 @@
 import { addedLines, chunkDiff, numberDiffLines } from './diff.js';
 import { chat } from './providers/index.js';
 
-const SEVERITIES = ['bug', 'security', 'performance', 'suggestion'];
+export const SEVERITIES = ['bug', 'security', 'performance', 'suggestion'];
 
 // The provider constrains the reply to this schema, so the model can't answer in the wrong shape.
 // Strict modes (Anthropic, Groq) need every property required and additionalProperties: false.
