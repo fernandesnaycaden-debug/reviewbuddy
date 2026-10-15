@@ -5,6 +5,8 @@ import { DEFAULT_TIMEOUT_MS, postJson, requireKey, withSchemaFallback } from './
 const API_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 const LABEL = 'Gemini';
 export const DEFAULT_MODEL = 'gemini-3.8-flash';
+// Most user-prompt characters (diff plus file context) to send, about 20k tokens.
+export const PROMPT_CHARS = 60_000;
 
 const NO_COMMENTS = '{"comments":[]}';
 const BLOCKED_FINISH_REASONS = ['SAFETY', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII', 'RECITATION'];

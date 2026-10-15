@@ -21,6 +21,9 @@ inputs:
   fail-on:
     description: Comma-separated severities that fail the check (bug, security, performance, suggestion). Empty never fails on findings.
     default: ''
+  min-severity:
+    description: Least serious severity to report (security > bug > performance > suggestion), like --min-severity. Empty reports everything.
+    default: ''
   ignore:
     description: Extra comma-separated file patterns to skip, like --ignore.
     default: ''
@@ -49,6 +52,7 @@ runs:
         INPUT_MODEL: ${{ inputs.model }}
         INPUT_API_KEY: ${{ inputs.api-key }}
         INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_MIN_SEVERITY: ${{ inputs.min-severity }}
         INPUT_IGNORE: ${{ inputs.ignore }}
         INPUT_FULL: ${{ inputs.full }}
         INPUT_TIMEOUT: ${{ inputs.timeout }}
@@ -61,6 +65,7 @@ runs:
         export GITHUB_TOKEN="$INPUT_GITHUB_TOKEN"
         export REVIEWBUDDY_PROVIDER="$INPUT_PROVIDER"
         export REVIEWBUDDY_FAIL_ON="$INPUT_FAIL_ON"
+        export REVIEWBUDDY_MIN_SEVERITY="$INPUT_MIN_SEVERITY"
         export REVIEWBUDDY_IGNORE="$INPUT_IGNORE"
         export REVIEWBUDDY_TIMEOUT="$INPUT_TIMEOUT"
 

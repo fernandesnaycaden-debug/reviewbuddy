@@ -1,0 +1,20 @@
+diff --git a/src/services/users.js b/src/services/users.js
+--- a/src/services/users.js
++++ b/src/services/users.js
+@@ -35,3 +35,16 @@ export async function deleteUser(id) {
+ export function formatUser(user) {
+   return `${user.name} <${user.email}>`;
+ }
++
++export async function greetingFor(id) {
++  const user = await getUser(id);
++  return `Hello, ${user.name.toUpperCase()}!`;
++}
++
++export function initials(names) {
++  const letters = [];
++  for (let i = 1; i < names.length; i++) {
++    letters.push(names[i].charAt(0).toUpperCase());
++  }
++  return letters.join('');
++}

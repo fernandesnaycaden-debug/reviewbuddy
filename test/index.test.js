@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import {
+  mkdir, mkdtemp, readFile, rm, writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, mock, test } from 'node:test';
 import { markerFor } from '../src/dedupe.js';
-import { buildReview, formatReport, main, parseFailOn, writeReport } from '../src/index.js';
+import {
+  buildReview, formatReport, main, parseFailOn, parseMinSeverity, writeReport,
+} from '../src/index.js';
 
 const diff = [
   'diff --git a/src/a.js b/src/a.js',
@@ -87,6 +91,38 @@ test('formatReport renders a summary and a table per file', () => {
   assert.match(report, /## `src\/b\.js`\n\n_No issues found\._/);
 });
 
+const withFix = [{
+  filename: 'src/a.js',
+  diff,
+  comments: [
+    { line: 2, severity: 'security', message: 'Hardcoded key', suggestion: 'const key = process.env.KEY;' },
+    { line: 40, severity: 'bug', message: 'Off-by-one', suggestion: 'for (let i = 0; i < n; i++) {' },
+  ],
+}];
+
+test('buildReview appends a suggestion block to inline comments only', () => {
+  const review = buildReview(withFix, { commitId: 'abc', model: 'm' });
+  assert.deepEqual(review.comments, [{
+    path: 'src/a.js',
+    line: 2,
+    body: '**[SECURITY]** Hardcoded key\n\n```suggestion\nconst key = process.env.KEY;\n```',
+  }]);
+  // Line 40 is outside the diff, so its finding goes in the body, without a suggestion GitHub couldn't apply.
+  assert.match(review.body, /^- `src\/a\.js:40` \*\*\[BUG\]\*\* Off-by-one$/m);
+  assert.doesNotMatch(review.body, /suggestion/);
+});
+
+test('buildReview lengthens the suggestion fence when the code has backticks', () => {
+  const results = [{ filename: 'src/a.js', diff, comments: [{ line: 2, severity: 'bug', message: 'Quote', suggestion: 'const s = ```x```;' }] }];
+  const [comment] = buildReview(results, { commitId: 'abc', model: 'm' }).comments;
+  assert.equal(comment.body, '**[BUG]** Quote\n\n````suggestion\nconst s = ```x```;\n````');
+});
+
+test('formatReport shows a suggestion as a Fix line', () => {
+  const report = formatReport([{ ...withFix[0], comments: [{ line: 2, severity: 'bug', message: 'Bad', suggestion: '  x = a || b;' }] }], { model: 'm', seconds: '1', date: new Date(0) });
+  assert.match(report, /\| 2 \| 🟠 \*\*BUG\*\* \| Bad<br>\*\*Fix:\*\* `x = a \\\|\\\| b;` \|/);
+});
+
 test('writeReport writes the report and returns its path', async () => {
   const path = await writeReport(results, { seconds: '1.5', outputPath: join(dir, 'report.md'), model: 'm' });
   assert.equal(path, join(dir, 'report.md'));
@@ -116,6 +152,7 @@ function withEnv(vars, fn) {
   vars = {
     REVIEWBUDDY_PROVIDER: '',
     REVIEWBUDDY_FAIL_ON: '',
+    REVIEWBUDDY_MIN_SEVERITY: '',
     GITHUB_ACTIONS: '',
     GITHUB_STEP_SUMMARY: '',
     GITHUB_EVENT_PATH: '',
@@ -153,12 +190,18 @@ const compareDiff = [
   '',
 ].join('\n');
 
+/** src/a.js at HEAD, matching both diffs. */
+const SOURCE = "const a = 1;\nconst key = 'secret';\nexport { a };\n";
+
 /**
  * Mock GitHub (PR 1 at HEAD, with the given reviews and review comments) and Ollama (replying with findings).
  * compare: the diff since the old commit, or null to answer 404. postStatus: answer the post with this error status.
- * Returns the posted review bodies, the requested URLs and the diffs sent to the model.
+ * source: src/a.js at HEAD, or null to answer 404.
+ * Returns the posted review bodies, the requested URLs and the prompts sent to the model.
  */
-function fakeGitHub({ reviews = [], comments = [], compare = compareDiff, findings = [hardcodedKey], postStatus } = {}) {
+function fakeGitHub({
+  reviews = [], comments = [], compare = compareDiff, findings = [hardcodedKey], postStatus, source = SOURCE,
+} = {}) {
   const calls = { posted: [], urls: [], reviewed: [] };
   mock.method(globalThis, 'fetch', async (url, init) => {
     calls.urls.push(url);
@@ -180,6 +223,9 @@ function fakeGitHub({ reviews = [], comments = [], compare = compareDiff, findin
       return Response.json(reviews.slice((page - 1) * 100, page * 100));
     }
     if (path.startsWith('pulls/1/comments')) return Response.json(comments);
+    if (path.startsWith('contents/')) {
+      return source === null ? Response.json({ message: 'Not Found' }, { status: 404 }) : new Response(source);
+    }
     if (init.headers.Accept === 'application/vnd.github.diff') return new Response(diff);
     return Response.json({ head: { sha: HEAD } });
   });
@@ -198,8 +244,9 @@ test('main reviews a pull request and posts the review', () => github(async () =
 
   await main([PR_URL, '--timeout', '5']);
 
-  // The PR, its reviews, its diff, the model, the post. No earlier reviews, so no compare or comments.
-  assert.equal(calls.urls.length, 5);
+  // The PR, its reviews, its diff, the file at HEAD, the model, the post. No earlier reviews, so no compare or comments.
+  assert.equal(calls.urls.length, 6);
+  assert.ok(calls.urls.includes(`https://api.github.com/repos/o/r/contents/src/a.js?ref=${HEAD}`));
   assert.equal(calls.posted.length, 1);
   assert.equal(calls.posted[0].commit_id, HEAD);
   assert.deepEqual(calls.posted[0].comments, [{ path: 'src/a.js', line: 2, body: '**[SECURITY]** Hardcoded key', side: 'RIGHT' }]);
@@ -444,3 +491,183 @@ test('a 403 when posting on a same-repo PR is still an error', async () => {
     await assert.rejects(main([PR_URL]), /GitHub returned HTTP 403/);
   });
 });
+
+// Full-file context
+
+test('main sends the PR file at the head commit as context before the diff', () => github(async () => {
+  const calls = fakeGitHub();
+
+  await main([PR_URL]);
+
+  const [prompt] = calls.reviewed;
+  assert.match(prompt, /=== FULL FILE \(for reference only; do NOT comment on lines outside the diff\) ===\n {3}1 const a = 1;\n {3}2 const key = 'secret';\n {3}3 export \{ a \};\n=== END OF REFERENCE ===\n\n=== DIFF TO REVIEW ===/);
+}));
+
+test('main reviews the diff alone when the file at the head commit is missing', () => github(async () => {
+  const calls = fakeGitHub({ source: null });
+
+  await main([PR_URL]);
+
+  assert.doesNotMatch(calls.reviewed[0], /FULL FILE/);
+  assert.equal(calls.posted.length, 1);
+}));
+
+/** Mock Ollama with findings for every request; returns the prompts it got. */
+function fakeOllama(findings) {
+  const prompts = [];
+  mock.method(globalThis, 'fetch', async (url, init) => {
+    prompts.push(JSON.parse(init.body).messages.at(-1).content);
+    return ollamaReply(findings);
+  });
+  return prompts;
+}
+
+/** Everything main printed with console.warn, as one string. */
+function warned() {
+  return console.warn.mock.calls.map((c) => c.arguments.join(' ')).join('\n');
+}
+
+test('main --repo-dir reads the changed file from a local checkout', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  const prompts = fakeOllama([]);
+  const repo = join(dir, 'repo');
+  await mkdir(join(repo, 'src'), { recursive: true });
+  await writeFile(join(repo, 'src', 'a.js'), SOURCE);
+  await writeFile(join(dir, 'changes.diff'), diff);
+
+  await main([join(dir, 'changes.diff'), '--repo-dir', repo]);
+
+  assert.match(prompts[0], /=== FULL FILE/);
+}));
+
+test('main ignores a local file that does not match the diff', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  const prompts = fakeOllama([]);
+  await mkdir(join(dir, 'src'));
+  await writeFile(join(dir, 'src', 'a.js'), 'something else\n');
+  await writeFile(join(dir, 'changes.diff'), diff);
+
+  await main([join(dir, 'changes.diff'), '--repo-dir', dir]);
+
+  assert.doesNotMatch(prompts[0], /FULL FILE/);
+  assert.match(warned(), /src\/a\.js doesn't match the diff/);
+}));
+
+test('main never reads a file outside --repo-dir, whatever path the diff names', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  const prompts = fakeOllama([]);
+  const repo = join(dir, 'repo');
+  await mkdir(repo);
+  await writeFile(join(dir, 'secret.js'), "const key = 'secret';\n");
+  await writeFile(join(dir, 'changes.diff'), diff.replaceAll('src/a.js', '../secret.js'));
+
+  await main([join(dir, 'changes.diff'), '--repo-dir', repo]);
+
+  assert.doesNotMatch(prompts[0], /FULL FILE/);
+  assert.match(warned(), /Not reading \.\.\/secret\.js for context/);
+}));
+
+test('main rejects a --repo-dir that is not a directory', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  await assert.rejects(main(['changes.diff', '--repo-dir', join(dir, 'nope')]), /--repo-dir .*nope is not a directory/);
+}));
+
+// --min-severity
+
+const mixed = [
+  { line: 2, severity: 'security', message: 'Hardcoded key', suggestion: '' },
+  { line: 2, severity: 'bug', message: 'Unused key', suggestion: '' },
+  { line: 2, severity: 'performance', message: 'Slow', suggestion: '' },
+  { line: 2, severity: 'suggestion', message: 'Rename', suggestion: '' },
+];
+
+test('parseMinSeverity reads one severity in any case and rejects unknown ones', () => {
+  assert.equal(parseMinSeverity(' Bug '), 'bug');
+  assert.equal(parseMinSeverity(''), undefined);
+  assert.equal(parseMinSeverity(undefined), undefined);
+  assert.throws(() => parseMinSeverity('critical'), /Unknown severity "critical" in --min-severity\. Use one of: security, bug, performance, suggestion\./);
+});
+
+test('main --min-severity leaves less serious findings out of the output and the report', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  fakeOllama(mixed);
+  const reportPath = join(dir, 'report.md');
+  await writeFile(join(dir, 'changes.diff'), diff);
+
+  await main([join(dir, 'changes.diff'), '--min-severity', 'bug', '-o', reportPath]);
+
+  const report = await readFile(reportPath, 'utf8');
+  assert.match(report, /Hardcoded key/);
+  assert.match(report, /Unused key/);
+  assert.doesNotMatch(report, /Slow|Rename/);
+  assert.doesNotMatch(logged(), /\[PERFORMANCE\]|\[SUGGESTION\]/);
+  assert.match(logged(), /Left out 2 findings below --min-severity bug\./);
+}));
+
+test('main --min-severity leaves less serious findings out of the posted review', () => github(async () => {
+  const calls = fakeGitHub({ findings: mixed });
+
+  await main([PR_URL, '--min-severity', 'security']);
+
+  assert.deepEqual(calls.posted[0].comments.map((c) => c.body), ['**[SECURITY]** Hardcoded key']);
+}));
+
+test('REVIEWBUDDY_MIN_SEVERITY works like --min-severity', () => withEnv({ OLLAMA_URL: 'http://ollama.test', REVIEWBUDDY_MIN_SEVERITY: 'Security' }, async () => {
+  fakeOllama(mixed);
+  await writeFile(join(dir, 'changes.diff'), diff);
+
+  await main([join(dir, 'changes.diff'), '--fail-on', 'bug']);
+
+  assert.notEqual(process.exitCode, 1);
+  assert.match(logged(), /Left out 3 findings below --min-severity security\./);
+}));
+
+test('main rejects an unknown --min-severity before reviewing', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  const fetch = mock.method(globalThis, 'fetch', async () => assert.fail('nothing should be fetched'));
+  await assert.rejects(main(['changes.diff', '--min-severity', 'high']), /Unknown severity "high" in --min-severity/);
+  assert.equal(fetch.mock.callCount(), 0);
+}));
+
+test('main --fail-on still fails on findings at or above --min-severity', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  fakeOllama(mixed);
+  await writeFile(join(dir, 'changes.diff'), diff);
+
+  await main([join(dir, 'changes.diff'), '--min-severity', 'bug', '--fail-on', 'bug']);
+
+  assert.equal(process.exitCode, 1);
+}));
+
+test('main --fail-on below --min-severity warns and never fails', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  fakeOllama(mixed);
+  await writeFile(join(dir, 'changes.diff'), diff);
+
+  await main([join(dir, 'changes.diff'), '--min-severity', 'bug', '--fail-on', 'suggestion']);
+
+  assert.notEqual(process.exitCode, 1);
+  assert.match(warned(), /--fail-on suggestion has no effect with --min-severity bug/);
+}));
+
+test('main --fail-on ignores earlier posted findings below --min-severity', () => github(async () => {
+  fakeGitHub({
+    reviews: [{ id: 1, body: markerFor(HEAD) }],
+    comments: [{ pull_request_review_id: 1, path: 'src/a.js', line: 2, body: '**[PERFORMANCE]** Slow' }],
+  });
+
+  await main([PR_URL, '--min-severity', 'bug', '--fail-on', 'performance']);
+
+  assert.notEqual(process.exitCode, 1);
+}));
+
+// Suggestions
+
+test('main posts a model suggestion as a suggestion block, indented like the line', () => github(async () => {
+  const calls = fakeGitHub({ findings: [{ ...hardcodedKey, suggestion: '    const key = process.env.KEY;' }] });
+
+  await main([PR_URL]);
+
+  assert.equal(calls.posted[0].comments[0].body, '**[SECURITY]** Hardcoded key\n\n```suggestion\nconst key = process.env.KEY;\n```');
+  assert.match(logged(), /^ {4}fix: const key = process\.env\.KEY;$/m);
+}));
+
+test('main drops a suggestion that is the same as the current line', () => github(async () => {
+  const calls = fakeGitHub({ findings: [{ ...hardcodedKey, suggestion: "const key = 'secret';" }] });
+
+  await main([PR_URL]);
+
+  assert.equal(calls.posted[0].comments[0].body, '**[SECURITY]** Hardcoded key');
+}));

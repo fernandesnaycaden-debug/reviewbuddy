@@ -1,5 +1,5 @@
-import { readFile, writeFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { readFile, stat, writeFile } from 'node:fs/promises';
+import { isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import {
@@ -10,11 +10,13 @@ import {
 } from './dedupe.js';
 import { commentableLines, splitDiff } from './diff.js';
 import {
-  getCompareDiff, getPullRequest, getPullRequestDiff, listReviewComments, listReviews, parsePrUrl, postReview,
+  getCompareDiff, getFileContent, getPullRequest, getPullRequestDiff, listReviewComments, listReviews, parsePrUrl, postReview,
 } from './github.js';
 import { DEFAULT_IGNORE, isIgnored, parsePatterns } from './ignore.js';
 import { describe as describeProvider, useProvider } from './providers/index.js';
-import { reviewDiff, SEVERITIES } from './review.js';
+import {
+  atLeast, reviewDiff, SEVERITIES, SEVERITY_ORDER,
+} from './review.js';
 
 const SAMPLE_DIFF = fileURLToPath(new URL('../samples/buggy.diff', import.meta.url));
 
@@ -27,15 +29,26 @@ export async function main(argv) {
       'fail-on': { type: 'string' },
       full: { type: 'boolean', default: false },
       ignore: { type: 'string' },
+      'min-severity': { type: 'string' },
       'no-default-ignore': { type: 'boolean', default: false },
       output: { type: 'string', short: 'o' },
       provider: { type: 'string' },
+      'repo-dir': { type: 'string' },
       timeout: { type: 'string' },
     },
     allowPositionals: true,
   });
 
   const failOn = parseFailOn(flags['fail-on'] ?? process.env.REVIEWBUDDY_FAIL_ON);
+  const minSeverity = parseMinSeverity(flags['min-severity'] ?? process.env.REVIEWBUDDY_MIN_SEVERITY);
+  const unreachable = failOn.filter((s) => !atLeast(s, minSeverity));
+  if (unreachable.length > 0) {
+    console.warn(`Warning: --fail-on ${unreachable.join(',')} has no effect with --min-severity ${minSeverity}, which leaves those findings out.`);
+  }
+  const repoDir = flags['repo-dir'];
+  if (repoDir !== undefined && !(await stat(repoDir).catch(() => null))?.isDirectory()) {
+    throw new Error(`--repo-dir ${repoDir} is not a directory.`);
+  }
 
   // Fail now on an unknown provider or a missing API key, rather than mid-review.
   let used;
@@ -55,7 +68,9 @@ export async function main(argv) {
     dryRun: flags['dry-run'],
     failOn,
     full: flags.full,
+    minSeverity,
     output: flags.output,
+    repoDir,
     timeoutMs: parseTimeout(flags.timeout ?? process.env.REVIEWBUDDY_TIMEOUT),
     ignorePatterns: [
       ...(flags['no-default-ignore'] ? [] : DEFAULT_IGNORE),
@@ -79,6 +94,16 @@ export function parseFailOn(value) {
     throw new Error(`Unknown severity "${unknown}" in --fail-on. Use a comma-separated list of: ${SEVERITIES.join(', ')}.`);
   }
   return [...new Set(wanted)];
+}
+
+/** The least serious severity to keep, from --min-severity or REVIEWBUDDY_MIN_SEVERITY. undefined keeps everything. */
+export function parseMinSeverity(value) {
+  const wanted = value?.trim().toLowerCase();
+  if (!wanted) return undefined;
+  if (!SEVERITY_ORDER.includes(wanted)) {
+    throw new Error(`Unknown severity "${value.trim()}" in --min-severity. Use one of: ${SEVERITY_ORDER.join(', ')}.`);
+  }
+  return wanted;
 }
 
 /**
@@ -133,7 +158,43 @@ async function reviewDiffFile(diffPath, options) {
     await appendStepSummary(`reviewbuddy: nothing to review in ${diffPath}.`);
     return [];
   }
-  return flatFindings(await reviewFiles(files, options));
+  return flatFindings(await reviewFiles(files, options, localSource(options.repoDir)));
+}
+
+/**
+ * Read a changed file from the local checkout (repoDir, else the current directory) for context.
+ * null if it isn't there, or if its path leads outside that directory: a crafted diff must not
+ * get other local files sent to the model.
+ */
+function localSource(repoDir = '.') {
+  const root = resolve(repoDir);
+  return async (filename) => {
+    const path = resolve(root, filename);
+    const rel = relative(root, path);
+    if (!rel || rel.startsWith('..') || isAbsolute(rel)) {
+      console.warn(`  Not reading ${filename} for context: it is outside ${root}.`);
+      return null;
+    }
+    try {
+      return await readFile(path, 'utf8');
+    } catch (err) {
+      if (err.code !== 'ENOENT') console.warn(`  Could not read ${filename} for context (${err.message}), reviewing the diff alone.`);
+      return null;
+    }
+  };
+}
+
+/** Fetch a changed file at the PR's head commit for context. null (with a warning) if that fails. */
+function remoteSource(pr, token, sha) {
+  return async (filename) => {
+    try {
+      return await getFileContent(pr, token, filename, sha);
+    } catch (err) {
+      const hint = err.status === 403 ? ' The token needs "Contents: Read" for this.' : '';
+      console.warn(`  Could not fetch ${filename} for context (${err.message}), reviewing the diff alone.${hint}`);
+      return null;
+    }
+  };
 }
 
 /**
@@ -153,7 +214,9 @@ async function reviewPullRequest(pr, options) {
   // Inline comments from our earlier reviews, fetched at most once and only when needed.
   let ourComments;
   const listOurComments = async () => (ourComments ??= ourReviews.size > 0 ? await listReviewComments(pr, token) : []);
-  const stillOpen = async () => (options.failOn.length > 0 ? openFindings(await listOurComments(), ourReviews) : []);
+  const stillOpen = async () => (options.failOn.length > 0
+    ? openFindings(await listOurComments(), ourReviews).filter((f) => atLeast(f.severity, options.minSeverity))
+    : []);
 
   const previous = options.full ? null : latestMarkedReview(reviews);
   if (previous?.sha === head.sha) {
@@ -177,7 +240,7 @@ async function reviewPullRequest(pr, options) {
   }
   console.log(`Pull request ${pr.owner}/${pr.repo}#${pr.number}: ${files.length} file(s) to review\n`);
 
-  let results = files.length > 0 ? await reviewFiles(files, options) : [];
+  let results = files.length > 0 ? await reviewFiles(files, options, remoteSource(pr, token, head.sha)) : [];
   // Judged before dropping repeats: a finding posted earlier is still in the code.
   const findings = [...flatFindings(results), ...await stillOpen()];
   if (ourReviews.size > 0 && countIssues(results) > 0) {
@@ -234,6 +297,7 @@ function short(sha) {
  * Turn review results into the { commitId, body, comments } posted to GitHub.
  * GitHub rejects the whole review if a comment points outside the diff,
  * so findings on other lines go into the review body instead.
+ * An inline comment with a suggestion ends with a ```suggestion block that GitHub can apply in one click.
  * The body ends with a hidden marker naming commitId; since (a short SHA) says the review covers only newer commits.
  */
 export function buildReview(results, { commitId, since, model, provider }) {
@@ -243,12 +307,22 @@ export function buildReview(results, { commitId, since, model, provider }) {
     const allowed = commentableLines(diff);
     for (const c of found) {
       const body = `**[${c.severity.toUpperCase()}]** ${c.message}`;
-      if (allowed.has(c.line)) comments.push({ path: filename, line: c.line, body });
-      else leftovers.push(`- \`${filename}:${c.line}\` ${body}`);
+      if (allowed.has(c.line)) {
+        comments.push({ path: filename, line: c.line, body: c.suggestion ? body + suggestionBlock(c.suggestion) : body });
+      } else {
+        leftovers.push(`- \`${filename}:${c.line}\` ${body}`);
+      }
     }
   }
   const body = `${reviewBody(results, leftovers, { since, model, provider })}\n\n${markerFor(commitId)}`;
   return { commitId, body, comments };
+}
+
+/** A GitHub suggestion block replacing the commented line with code. The fence outgrows any backticks in it. */
+function suggestionBlock(code) {
+  let fence = '```';
+  while (code.includes(fence)) fence += '`';
+  return `\n\n${fence}suggestion\n${code}\n${fence}`;
 }
 
 /** Leave out lockfiles, generated files and anything else on the ignore list. */
@@ -274,18 +348,27 @@ function reviewBody(results, leftovers, { since, model, provider }) {
   return lines.join('\n');
 }
 
-/** Review each file, print the findings, and return [{ filename, diff, comments }]. */
-async function reviewFiles(files, { output, timeoutMs }) {
+/**
+ * Review each file, print the findings, and return [{ filename, diff, comments }].
+ * loadSource(filename) gives the file's new version for context, or null.
+ * Findings below minSeverity are left out here, so nothing later sees them.
+ */
+async function reviewFiles(files, { output, timeoutMs, minSeverity }, loadSource) {
   const start = performance.now();
   const results = [];
+  let below = 0;
 
   for (const [i, file] of files.entries()) {
     console.log(`Reviewing ${file.filename} (${i + 1}/${files.length}) ...`);
-    const comments = await reviewDiff(file.filename, file.diff, { timeoutMs });
+    const source = await loadSource(file.filename);
+    const found = await reviewDiff(file.filename, file.diff, { timeoutMs, source });
+    const comments = found.filter((c) => atLeast(c.severity, minSeverity));
+    below += found.length - comments.length;
     results.push({ ...file, comments });
 
     for (const c of comments) {
       console.log(`  ${file.filename}:${c.line} [${c.severity.toUpperCase()}] ${c.message}`);
+      if (c.suggestion) console.log(`    fix: ${c.suggestion.trim()}`);
     }
     if (comments.length === 0) console.log('  No issues found.');
     console.log();
@@ -293,6 +376,7 @@ async function reviewFiles(files, { output, timeoutMs }) {
 
   const seconds = ((performance.now() - start) / 1000).toFixed(1);
   console.log(`${plural(countIssues(results), 'issue')} in ${plural(files.length, 'file')}. Review took ${seconds}s`);
+  if (below > 0) console.log(`Left out ${plural(below, 'finding')} below --min-severity ${minSeverity}.`);
 
   if (output) {
     const filePath = await writeReport(results, { seconds, outputPath: output });
@@ -347,11 +431,19 @@ export function formatReport(results, { model, provider, seconds, date }) {
     lines.push('|------|----------|-------|');
     for (const c of comments) {
       const icon = SEVERITY_ICON[c.severity] || 'ℹ️';
-      lines.push(`| ${c.line} | ${icon} **${c.severity.toUpperCase()}** | ${c.message} |`);
+      const fix = c.suggestion ? `<br>**Fix:** ${inlineCode(c.suggestion.trim())}` : '';
+      lines.push(`| ${c.line} | ${icon} **${c.severity.toUpperCase()}** | ${c.message}${fix} |`);
     }
     lines.push('');
   }
   return lines.join('\n');
+}
+
+/** code as a Markdown code span that is safe inside a table cell. */
+function inlineCode(code) {
+  const ticks = code.includes('`') ? '``' : '`';
+  const pad = code.includes('`') ? ' ' : '';
+  return `${ticks}${pad}${code.replace(/\|/g, '\\|')}${pad}${ticks}`;
 }
 
 /**

@@ -57,6 +57,11 @@ export function addedLines(diff) {
   return new Set(annotateLines(diff).filter((l) => l.newLine && l.text.startsWith('+')).map((l) => l.newLine));
 }
 
+/** The text of each added or context line (without its "+" or " "), by its line number in the new file. */
+export function newLineTexts(diff) {
+  return new Map(annotateLines(diff).filter((l) => l.newLine).map((l) => [l.newLine, l.text.slice(1)]));
+}
+
 /**
  * Split a single-file diff into pieces of at most maxChars, cutting only between
  * hunks, so a big file doesn't overflow the model's context window. Each piece keeps

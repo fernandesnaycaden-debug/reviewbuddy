@@ -112,6 +112,30 @@ npm run review -- changes.diff --no-default-ignore   # review lockfiles, dist/ e
 
 Large files are reviewed in several parts so they fit in the model's context window.
 
+### Full-file context
+
+A diff alone hides a lot: a value that looks unchecked may be validated a few lines above the hunk, and a function that looks undefined may be defined further down. So besides the diff, reviewbuddy sends the model the new version of each changed file, in a separate section marked as reference only. The model is told to use it to check whether the surrounding code already handles a problem, and never to comment on lines outside the diff (comments on other lines are dropped anyway).
+
+- **Pull requests:** each changed file is downloaded at the PR's head commit. Fine-grained tokens need **Contents: Read** for this. Without it, reviewbuddy warns and reviews that file from the diff alone.
+- **Diff files:** each changed file is read from the current directory, or from `--repo-dir` if you pass one. Use it when you run reviewbuddy from somewhere other than the project:
+
+  ```powershell
+  npm run review -- C:\path\to\your-project\changes.diff --repo-dir C:\path\to\your-project
+  ```
+
+  If the file isn't there, or its content doesn't match the diff (say, a different branch is checked out), that file is reviewed from the diff alone. Paths in the diff that lead outside the directory (`../`) are never read.
+
+The context has to fit in a per-provider budget for the whole prompt, so the model's context window and free-tier limits aren't exceeded. If the full file doesn't fit next to the diff, reviewbuddy sends only the 40 lines around each change. If even that doesn't fit, it sends the diff alone, as before.
+
+| Provider | Prompt budget (characters, about 3 per token) |
+|----------|----------------------------------|
+| Ollama | 16,000 (its context is 8,192 tokens, so a file is added only when the diff leaves room) |
+| Groq | 24,000 (the free tier limits tokens per minute) |
+| OpenRouter | 40,000 |
+| Gemini, Anthropic | 60,000 |
+
+More context means more input tokens per request: up to the budget above, usually far less, since most files are a few thousand characters. On free tiers that can bring rate limits sooner; on Anthropic it costs more per review.
+
 ## Save the results to a file
 
 Add `--output` (or `-o`) to write a formatted Markdown report alongside the terminal output:
@@ -134,6 +158,19 @@ $env:REVIEWBUDDY_FAIL_ON = "security"   # same thing, as a variable; the flag wi
 
 On a pull request, a finding counts as long as it is still there, not just when it is new: findings from this run count even if they were already posted, and so do inline comments from earlier reviewbuddy reviews whose line hasn't changed since. Once the code under such a comment changes, GitHub marks it outdated and it stops counting. So pushing an unrelated commit doesn't make the check pass, but fixing the flagged line does.
 
+## Only report serious findings
+
+Severities rank `security` > `bug` > `performance` > `suggestion`. Add `--min-severity` to leave out everything less serious than the one you name. For example, `--min-severity bug` keeps security and bug findings and drops performance and suggestion ones:
+
+```powershell
+npm run review -- changes.diff --min-severity bug
+$env:REVIEWBUDDY_MIN_SEVERITY = "bug"   # same thing, as a variable; the flag wins
+```
+
+Dropped findings are left out everywhere: the terminal, the report, the posted review, the annotations and `--fail-on`. The run prints how many it left out. By default nothing is dropped.
+
+`--fail-on` only sees what `--min-severity` keeps, so `--min-severity bug --fail-on performance` can never fail; reviewbuddy warns about such a combination.
+
 ## Review a GitHub pull request
 
 Pass the PR's URL instead of a diff file. reviewbuddy downloads the diff, reviews each file, and posts one review on the PR with a comment on each problem line.
@@ -141,7 +178,7 @@ Pass the PR's URL instead of a diff file. reviewbuddy downloads the diff, review
 First create a token at GitHub → Settings → Developer settings → [Fine-grained tokens](https://github.com/settings/personal-access-tokens/new):
 
 - **Repository access:** only the repos you want reviewed
-- **Permissions:** Pull requests → **Read and write**
+- **Permissions:** Pull requests → **Read and write**, and Contents → **Read** (for [full-file context](#full-file-context))
 
 ```powershell
 $env:GITHUB_TOKEN = "github_pat_..."
@@ -158,7 +195,22 @@ How the review looks on GitHub:
 
 - It is a plain comment review. reviewbuddy never approves a PR or requests changes.
 - Each finding is an inline comment like **[SECURITY]** Hardcoded API key; load it from an environment variable.
-- The review summary says how many issues were found and which model found them. Findings that point at a line outside the diff can't be attached to that line, so they are listed in the summary instead.
+- When the fix is a small, certain change to that one line, the comment ends with a GitHub suggestion. The author can apply it with **Commit suggestion**, or batch several into one commit from the **Files changed** tab.
+- The review summary says how many issues were found and which model found them. Findings that point at a line outside the diff can't be attached to that line, so they are listed in the summary instead (without a suggestion).
+
+### Suggested fixes
+
+The model gives a replacement line only when it is sure, and only for a fix that fits on the commented line. reviewbuddy then checks it: an empty suggestion, one spanning several lines, or one identical to the current line is dropped, and the line's original indentation is kept. An inline comment with one is posted like this:
+
+````markdown
+**[BUG]** Off-by-one: the loop starts at 1, so the first name is skipped.
+
+```suggestion
+  for (let i = 0; i < names.length; i++) {
+```
+````
+
+On GitHub that shows as the finding, then a diff of the line with the old version in red and the fix in green, and a **Commit suggestion** button. In the terminal the fix is printed under the finding as `fix: ...`, and in the Markdown report it appears as **Fix:** after the issue.
 
 ### Running it again on the same PR
 
@@ -221,7 +273,7 @@ Every time a PR is opened, gets new commits, is reopened or is marked ready for 
 - Each finding is also an annotation: `security` and `bug` as errors, `performance` and `suggestion` as warnings. They show on the run page and next to the code in the PR's **Files changed** tab.
 - With `fail-on`, the check fails when a finding of a listed severity is still in the PR (see [Fail on certain findings](#fail-on-certain-findings)).
 
-No checkout step is needed: the action downloads the PR's diff from the GitHub API.
+No checkout step is needed: the action downloads the PR's diff and the changed files from the GitHub API. The `contents: read` permission in the example workflow covers the files.
 
 | Input | Default | Meaning |
 |-------|---------|---------|
@@ -229,6 +281,7 @@ No checkout step is needed: the action downloads the PR's diff from the GitHub A
 | `api-key` | none | API key for that provider; pass it from a secret |
 | `model` | the provider's default | Model to use, like that provider's `*_MODEL` variable |
 | `fail-on` | none | Comma-separated severities that fail the check, like `--fail-on` |
+| `min-severity` | none (report everything) | Least serious severity to report: `security`, `bug`, `performance` or `suggestion`, like `--min-severity` |
 | `ignore` | none | Extra comma-separated file patterns to skip, like `--ignore` |
 | `full` | `false` | `true` reviews the whole PR every time, like `--full` |
 | `timeout` | the provider's default | Seconds a single model request may take, like `--timeout` |
@@ -269,9 +322,12 @@ A PR with an open finding of a listed severity can then not be merged until the 
 | `GITHUB_TOKEN` | none                     | Token used to read PRs and post reviews |
 | `REVIEWBUDDY_IGNORE` | none               | Extra comma-separated patterns to skip, like `--ignore` |
 | `REVIEWBUDDY_FAIL_ON` | none              | Comma-separated severities that make the run exit with code 1, like `--fail-on` |
+| `REVIEWBUDDY_MIN_SEVERITY` | none (report everything) | Least serious severity to report (`security` > `bug` > `performance` > `suggestion`), like `--min-severity` |
 | `REVIEWBUDDY_TIMEOUT` | `600` (Ollama), `300` (cloud) | Seconds a single model request may take, like `--timeout`. `0` means no limit |
 
 Pass `--timeout <seconds>` to override `REVIEWBUDDY_TIMEOUT` for one run, for example `npm run review -- changes.diff --timeout 1200` for a slow model.
+
+For diff files, `--repo-dir <path>` says where to read the changed files for [full-file context](#full-file-context). It defaults to the current directory and has no variable.
 
 With the default Claude models (Opus 5.5, Sonnet 5.5, Opus 5, Fable 5.1), reviewbuddy turns on Anthropic's server-side refusal fallback. If a safety classifier declines to review a piece of code, another Claude model finishes the request. A piece that is still declined, or that Gemini blocks, is skipped with a warning.
 
@@ -283,7 +339,7 @@ Network errors and HTTP 429/5xx responses from GitHub, Ollama and the cloud prov
 npm test
 ```
 
-The tests cover diff parsing, line numbering, chunking, the ignore list, reply parsing, retries and timeouts, the GitHub client (including pagination and compare diffs), review markers and skipping findings already posted, re-runs (same commit, new commits, force-push fallback, `--full`), splitting findings between inline comments and the review body, the Markdown report, `--fail-on` and exit codes, GitHub Actions annotations (and their escaping), the job summary, fork PRs without a key or with a read-only token, a full run with GitHub and Ollama mocked, and each cloud provider's requests, replies and errors (provider selection, missing keys, schema fallback, 401/404/429). They need neither Ollama, API keys nor network access.
+The tests cover diff parsing, line numbering, chunking, the ignore list, reply parsing, full-file context (the full file, the windows around each hunk, the budget cutoff, files that don't match the diff, fetching files at the head commit, `--repo-dir` and paths outside it), `--min-severity` and how it interacts with `--fail-on`, suggested fixes (parsing, validation, indentation, the suggestion block in posted comments, the report's Fix line), each provider's prompt budget, retries and timeouts, the GitHub client (including pagination and compare diffs), review markers and skipping findings already posted, re-runs (same commit, new commits, force-push fallback, `--full`), splitting findings between inline comments and the review body, the Markdown report, `--fail-on` and exit codes, GitHub Actions annotations (and their escaping), the job summary, fork PRs without a key or with a read-only token, a full run with GitHub and Ollama mocked, and each cloud provider's requests, replies and errors (provider selection, missing keys, schema fallback, 401/404/429). They need neither Ollama, API keys nor network access.
 
 ## Expected output
 
@@ -304,6 +360,26 @@ Reviewing src/services/orders.js (1/1) ...
 
 3 issues in 1 file. Review took 14.2s
 ```
+
+There is no copy of `src/services/orders.js` next to the diff, so this sample is always reviewed from the diff alone.
+
+### Measuring false positives
+
+[samples/context-trap.diff](samples/context-trap.diff) adds two functions to [samples/context-trap/src/services/users.js](samples/context-trap/src/services/users.js):
+
+| Line | What it is | A good review |
+|------|------------|---------------|
+| 41 | `user.name.toUpperCase()` on a user from `getUser(id)`. In the hunk it looks unchecked, but `getUser`, higher up in the same file, throws when the user is missing or has no name. | Says nothing |
+| 46 | Off-by-one loop: `let i = 1` skips the first name | Reports a bug, ideally with `fix: for (let i = 0; ...` |
+
+Run it twice, without and with the file for context, and compare:
+
+```powershell
+npm run review -- samples/context-trap.diff                                    # before: diff only
+npm run review -- samples/context-trap.diff --repo-dir samples/context-trap   # after: with the full file
+```
+
+The first run can't see `getUser`, so models often flag line 41 as a possible null. The second run should only report line 46 and print `with the full file as context`. Try it with your usual provider and model, and run `samples/buggy.diff` too, to check that all three planted bugs are still found. Results vary from run to run, so run each a few times before drawing conclusions.
 
 ## Troubleshooting
 
@@ -331,6 +407,11 @@ Reviewing src/services/orders.js (1/1) ...
 | `Previous review's commit abc1234 no longer exists ... reviewing the whole PR` | The branch was force-pushed or rebased, so there's nothing to diff against. reviewbuddy reviews the whole PR instead; findings already posted are still skipped. |
 | `No new findings to post.` | Not an error: the new commits had no issues, or every finding was already posted. Nothing was posted. |
 | `Unknown severity "..." in --fail-on` | Use only `bug`, `security`, `performance` and `suggestion`, separated by commas, in `--fail-on`, `REVIEWBUDDY_FAIL_ON` or the action's `fail-on` input. |
+| `Unknown severity "..." in --min-severity` | Use exactly one of `security`, `bug`, `performance` or `suggestion` in `--min-severity`, `REVIEWBUDDY_MIN_SEVERITY` or the action's `min-severity` input. |
+| `--fail-on ... has no effect with --min-severity ...` | Only a warning: those findings are left out before `--fail-on` sees them. Lower `--min-severity` or drop them from `--fail-on`. |
+| `Could not fetch ... for context ... The token needs "Contents: Read"` | Only a warning: that file is reviewed from the diff alone. Give the token Contents → Read access. |
+| `... doesn't match the diff (another version checked out?)` | Only a warning: the local file isn't the diff's new version. Check out the branch the diff came from, or point `--repo-dir` at it. |
+| `--repo-dir ... is not a directory` | Check the path passed to `--repo-dir`. |
 | `Failing: 2 findings match --fail-on security` | Not a crash: findings of a severity you listed are still in the code, so the run exits with code 1. Fix the flagged lines, or change `--fail-on`. |
 | `Ollama doesn't run on GitHub-hosted runners` | Set the action's `provider` input to `groq`, `openrouter`, `gemini` or `anthropic` and pass its `api-key` from a secret. |
 | `Set GROQ_API_KEY ... In GitHub Actions, add the key as a repository secret` | The workflow didn't get a key. Add the secret (Settings → Secrets and variables → Actions) and check that `api-key:` names it exactly. |
