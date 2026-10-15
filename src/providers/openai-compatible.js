@@ -7,8 +7,11 @@ import {
 /**
  * Build a provider for an OpenAI-compatible /chat/completions endpoint.
  * headers are sent with every request; schemaBody is merged into requests that carry a schema.
+ * promptChars: most user-prompt characters (diff plus file context) to send.
  */
-export function openAICompatible({ label, url, keyVar, keyUrl, modelVar, defaultModel, headers = {}, schemaBody = {}, hints }) {
+export function openAICompatible({
+  label, url, keyVar, keyUrl, modelVar, defaultModel, promptChars, headers = {}, schemaBody = {}, hints,
+}) {
   const modelName = () => process.env[modelVar] || defaultModel;
   const checkConfig = () => requireKey(keyVar, label, keyUrl);
 
@@ -49,5 +52,5 @@ export function openAICompatible({ label, url, keyVar, keyUrl, modelVar, default
     return reply.choices?.[0]?.message?.content ?? '';
   }
 
-  return { chat, modelName, checkConfig, DEFAULT_MODEL: defaultModel };
+  return { chat, modelName, checkConfig, DEFAULT_MODEL: defaultModel, PROMPT_CHARS: promptChars };
 }

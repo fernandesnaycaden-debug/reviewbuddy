@@ -7,6 +7,10 @@ import { fetchWithRetry } from '../http.js';
 const DEFAULT_URL = 'http://localhost:11434';
 export const DEFAULT_MODEL = 'qwen3.5:4b';
 export const DEFAULT_TIMEOUT_MS = 600_000;
+const NUM_CTX = 8192;
+// Most user-prompt characters (diff plus file context) to send. num_ctx is 8192 tokens at about
+// 3 characters each, and the system prompt and the reply need room too.
+export const PROMPT_CHARS = 16_000;
 
 export function modelName() {
   return process.env.OLLAMA_MODEL || DEFAULT_MODEL;
@@ -33,7 +37,7 @@ export async function chat(systemPrompt, userPrompt, schema, { timeoutMs = DEFAU
         model,
         stream: true,
         format: schema ?? 'json',
-        options: { temperature: 0.2, num_ctx: 8192 },
+        options: { temperature: 0.2, num_ctx: NUM_CTX },
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },

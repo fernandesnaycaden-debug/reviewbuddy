@@ -1,5 +1,5 @@
 // Picks the model backend for a run. Every provider exports chat(systemPrompt, userPrompt, schema, options),
-// DEFAULT_MODEL and modelName(); cloud providers also export checkConfig(), which throws if the API key is missing.
+// DEFAULT_MODEL, PROMPT_CHARS and modelName(); cloud providers also export checkConfig(), which throws if the API key is missing.
 
 import * as anthropic from './anthropic.js';
 import * as gemini from './gemini.js';
@@ -36,6 +36,11 @@ export function chat(...args) {
 export function describe() {
   const { modelName } = current();
   return { provider: selected, model: modelName() };
+}
+
+/** The most user-prompt characters (diff plus file context) the selected provider should get. */
+export function promptChars() {
+  return current().PROMPT_CHARS;
 }
 
 function current() {

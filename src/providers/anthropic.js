@@ -5,6 +5,8 @@ import { DEFAULT_TIMEOUT_MS, postJson, requireKey, withSchemaFallback } from './
 const API_URL = 'https://api.anthropic.com/v1/messages';
 const LABEL = 'Anthropic';
 export const DEFAULT_MODEL = 'claude-opus-5-5';
+// Most user-prompt characters (diff plus file context) to send, about 20k tokens. Paid per token.
+export const PROMPT_CHARS = 60_000;
 
 const NO_COMMENTS = '{"comments":[]}';
 // Models that can hand a declined request to another Claude model server-side.

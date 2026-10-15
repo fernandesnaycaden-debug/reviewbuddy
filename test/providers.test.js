@@ -7,7 +7,9 @@ import { main } from '../src/index.js';
 import * as anthropic from '../src/providers/anthropic.js';
 import * as gemini from '../src/providers/gemini.js';
 import * as groq from '../src/providers/groq.js';
-import { chat, describe, useProvider } from '../src/providers/index.js';
+import {
+  chat, describe, promptChars, useProvider,
+} from '../src/providers/index.js';
 import * as openrouter from '../src/providers/openrouter.js';
 
 const SCHEMA = { type: 'object', properties: { comments: { type: 'array' } }, required: ['comments'], additionalProperties: false };
@@ -57,6 +59,15 @@ function errorReply(status, message) {
 
 test('useProvider defaults to ollama', () => {
   assert.deepEqual(useProvider(), { provider: 'ollama', model: 'qwen3.5:4b' });
+});
+
+test('every provider has a prompt budget, and Ollama\'s fits its 8192-token context', () => {
+  Object.assign(process.env, { GROQ_API_KEY: KEY, OPENROUTER_API_KEY: KEY, GEMINI_API_KEY: KEY, ANTHROPIC_API_KEY: KEY });
+  const budgets = Object.fromEntries(['ollama', 'groq', 'openrouter', 'gemini', 'anthropic'].map((name) => {
+    useProvider(name);
+    return [name, promptChars()];
+  }));
+  assert.deepEqual(budgets, { ollama: 16_000, groq: 24_000, openrouter: 40_000, gemini: 60_000, anthropic: 60_000 });
 });
 
 test('useProvider reads REVIEWBUDDY_PROVIDER, and a name passed in wins over it', () => {

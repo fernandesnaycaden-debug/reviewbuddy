@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, mock, test } from 'node:test';
 import {
-  getCompareDiff, getPullRequest, getPullRequestDiff, listReviewComments, listReviews, postReview,
+  getCompareDiff, getFileContent, getPullRequest, getPullRequestDiff, listReviewComments, listReviews, postReview,
 } from '../src/github.js';
 
 const pr = { owner: 'o', repo: 'r', number: 12 };
@@ -72,6 +72,28 @@ test('getCompareDiff returns null when the old commit is gone, and throws on oth
 
   mockFetch(json({ message: 'Forbidden' }, 403));
   await assert.rejects(getCompareDiff(pr, 'tok', 'old', 'new'), /HTTP 403/);
+});
+
+test('getFileContent fetches the raw file at a commit, encoding the path', async () => {
+  const fetch = mockFetch(new Response('const a = 1;\n'));
+  assert.equal(await getFileContent(pr, 'tok', 'src/my file#1.js', 'abc123'), 'const a = 1;\n');
+
+  const [url, init] = fetch.mock.calls[0].arguments;
+  assert.equal(url, 'https://api.github.com/repos/o/r/contents/src/my%20file%231.js?ref=abc123');
+  assert.equal(init.headers.Accept, 'application/vnd.github.raw+json');
+  assert.equal(init.headers.Authorization, 'Bearer tok');
+});
+
+test('getFileContent returns null for a missing file, retries a server error, and throws on others', async () => {
+  mockFetch(json({ message: 'Not Found' }, 404));
+  assert.equal(await getFileContent(pr, 'tok', 'gone.js', 'abc'), null);
+
+  const fetch = mockFetch(new Response('', { status: 502, headers: { 'Retry-After': '0' } }), new Response('ok'));
+  assert.equal(await getFileContent(pr, 'tok', 'a.js', 'abc'), 'ok');
+  assert.equal(fetch.mock.callCount(), 2);
+
+  mockFetch(json({ message: 'Forbidden' }, 403));
+  await assert.rejects(getFileContent(pr, 'tok', 'a.js', 'abc'), (err) => err.status === 403);
 });
 
 test('postReview posts a comment review on the right side of the diff', async () => {

@@ -1,4 +1,4 @@
-// GitHub REST API client: fetches a pull request's diff and earlier reviews, and posts a review on it.
+// GitHub REST API client: fetches a pull request's diff, changed files and earlier reviews, and posts a review on it.
 
 import { fetchWithRetry } from './http.js';
 
@@ -37,6 +37,23 @@ export async function getCompareDiff(pr, token, base, head) {
   try {
     const response = await request(pr, token, `compare/${base}...${head}`, {
       headers: { Accept: 'application/vnd.github.diff' },
+    });
+    return await response.text();
+  } catch (err) {
+    if (err.status === 404) return null;
+    throw err;
+  }
+}
+
+/**
+ * Fetch a file's content at commit ref, as text. Returns null if the file isn't there.
+ * Needs "Contents: Read" on fine-grained tokens.
+ */
+export async function getFileContent(pr, token, path, ref) {
+  const encoded = path.split('/').map(encodeURIComponent).join('/');
+  try {
+    const response = await request(pr, token, `contents/${encoded}?ref=${encodeURIComponent(ref)}`, {
+      headers: { Accept: 'application/vnd.github.raw+json' },
     });
     return await response.text();
   } catch (err) {
