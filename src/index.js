@@ -5,7 +5,7 @@ import { parseArgs } from 'node:util';
 import { commentableLines, splitDiff } from './diff.js';
 import { getPullRequest, getPullRequestDiff, parsePrUrl, postReview } from './github.js';
 import { DEFAULT_IGNORE, isIgnored, parsePatterns } from './ignore.js';
-import { DEFAULT_MODEL } from './providers/ollama.js';
+import { describe as describeProvider, useProvider } from './providers/index.js';
 import { reviewDiff } from './review.js';
 
 const SAMPLE_DIFF = fileURLToPath(new URL('../samples/buggy.diff', import.meta.url));
@@ -19,10 +19,15 @@ export async function main(argv) {
       ignore: { type: 'string' },
       'no-default-ignore': { type: 'boolean', default: false },
       output: { type: 'string', short: 'o' },
+      provider: { type: 'string' },
       timeout: { type: 'string' },
     },
     allowPositionals: true,
   });
+
+  // Fail now on an unknown provider or a missing API key, rather than mid-review.
+  const { provider, model } = useProvider(flags.provider);
+  console.log(`Using ${provider} (${model})\n`);
 
   const options = {
     dryRun: flags['dry-run'],
@@ -75,7 +80,7 @@ async function reviewPullRequest(pr, options) {
   console.log(`Pull request ${pr.owner}/${pr.repo}#${pr.number}: ${files.length} file(s) to review\n`);
 
   const results = files.length > 0 ? await reviewFiles(files, options) : [];
-  const review = buildReview(results, { commitId: head.sha, model: modelName() });
+  const review = buildReview(results, { commitId: head.sha, ...describeProvider() });
 
   if (options.dryRun) {
     console.log('Dry run, not posting. The review would be:\n');
@@ -91,7 +96,7 @@ async function reviewPullRequest(pr, options) {
  * GitHub rejects the whole review if a comment points outside the diff,
  * so findings on other lines go into the review body instead.
  */
-export function buildReview(results, { commitId, model }) {
+export function buildReview(results, { commitId, model, provider }) {
   const comments = [];
   const leftovers = [];
   for (const { filename, diff, comments: found } of results) {
@@ -102,7 +107,7 @@ export function buildReview(results, { commitId, model }) {
       else leftovers.push(`- \`${filename}:${c.line}\` ${body}`);
     }
   }
-  return { commitId, body: reviewBody(results, leftovers, model), comments };
+  return { commitId, body: reviewBody(results, leftovers, { model, provider }), comments };
 }
 
 /** Leave out lockfiles, generated files and anything else on the ignore list. */
@@ -115,11 +120,12 @@ function reviewable(files, { ignorePatterns }) {
   return kept;
 }
 
-function reviewBody(results, leftovers, model) {
+function reviewBody(results, leftovers, { model, provider }) {
   const total = countIssues(results);
+  const by = `model \`${model}\`${provider ? ` via ${provider}` : ''}`;
   const lines = [total === 0
-    ? `reviewbuddy found no issues in ${plural(results.length, 'file')} (model \`${model}\`).`
-    : `reviewbuddy found ${plural(total, 'issue')} in ${plural(results.length, 'file')} (model \`${model}\`).`];
+    ? `reviewbuddy found no issues in ${plural(results.length, 'file')} (${by}).`
+    : `reviewbuddy found ${plural(total, 'issue')} in ${plural(results.length, 'file')} (${by}).`];
   if (leftovers.length > 0) {
     lines.push('', 'These point at lines outside the diff, so they could not be posted inline:', ...leftovers);
   }
@@ -153,10 +159,6 @@ async function reviewFiles(files, { output, timeoutMs }) {
   return results;
 }
 
-function modelName() {
-  return process.env.OLLAMA_MODEL || DEFAULT_MODEL;
-}
-
 function countIssues(results) {
   return results.reduce((sum, r) => sum + r.comments.length, 0);
 }
@@ -168,7 +170,7 @@ function plural(count, word) {
 const SEVERITY_ICON = { security: '🔴', bug: '🟠', performance: '🟡', suggestion: '🔵' };
 
 /** Render review results as a Markdown report. */
-export function formatReport(results, { model, seconds, date }) {
+export function formatReport(results, { model, provider, seconds, date }) {
   const total = countIssues(results);
   const lines = [
     '# 🔍 ReviewBuddy Report',
@@ -177,6 +179,7 @@ export function formatReport(results, { model, seconds, date }) {
     '',
     '| Detail | Value |',
     '|--------|-------|',
+    ...(provider ? [`| Provider | ${provider} |`] : []),
     `| Model | \`${model}\` |`,
     `| Date | ${date.toLocaleString()} |`,
     `| Files reviewed | ${results.length} |`,
@@ -204,9 +207,13 @@ export function formatReport(results, { model, seconds, date }) {
   return lines.join('\n');
 }
 
-/** Write the Markdown report to outputPath and return its absolute path. */
-export async function writeReport(results, { seconds, outputPath, model = modelName(), date = new Date() }) {
+/**
+ * Write the Markdown report to outputPath and return its absolute path.
+ * model and provider default to the selected provider.
+ */
+export async function writeReport(results, { seconds, outputPath, date = new Date(), ...used }) {
   const filePath = resolve(outputPath);
-  await writeFile(filePath, formatReport(results, { model, seconds, date }), 'utf8');
+  const { model, provider } = used.model ? used : describeProvider();
+  await writeFile(filePath, formatReport(results, { model, provider, seconds, date }), 'utf8');
   return filePath;
 }
