@@ -1,4 +1,4 @@
-// GitHub REST API client: fetches a pull request's diff and posts a review on it.
+// GitHub REST API client: fetches a pull request's diff and earlier reviews, and posts a review on it.
 
 import { fetchWithRetry } from './http.js';
 
@@ -30,6 +30,32 @@ export async function getPullRequestDiff(pr, token) {
 }
 
 /**
+ * Fetch the diff from commit base to head (base...head) on its own.
+ * Returns null if GitHub doesn't know base any more, e.g. after a force-push or rebase.
+ */
+export async function getCompareDiff(pr, token, base, head) {
+  try {
+    const response = await request(pr, token, `compare/${base}...${head}`, {
+      headers: { Accept: 'application/vnd.github.diff' },
+    });
+    return await response.text();
+  } catch (err) {
+    if (err.status === 404) return null;
+    throw err;
+  }
+}
+
+/** List every review on the pull request, oldest first. */
+export function listReviews(pr, token) {
+  return listAll(pr, token, `pulls/${pr.number}/reviews`);
+}
+
+/** List every inline review comment on the pull request. */
+export function listReviewComments(pr, token) {
+  return listAll(pr, token, `pulls/${pr.number}/comments`);
+}
+
+/**
  * Post a review with inline comments. It is always a plain comment review:
  * reviewbuddy never approves or requests changes.
  * comments: [{ path, line, body }], where line is a line number in the new file.
@@ -51,6 +77,19 @@ export async function postReview(pr, token, { commitId, body, comments }) {
     retryStatuses: [429],
   });
   return response.json();
+}
+
+const PER_PAGE = 100;
+
+/** GET a list endpoint page by page until a page comes back short. */
+async function listAll(pr, token, path) {
+  const items = [];
+  for (let page = 1; ; page++) {
+    const response = await request(pr, token, `${path}?per_page=${PER_PAGE}&page=${page}`);
+    const batch = await response.json();
+    items.push(...batch);
+    if (batch.length < PER_PAGE) return items;
+  }
 }
 
 async function request(pr, token, path, options = {}, retry = {}) {
@@ -88,5 +127,6 @@ async function request(pr, token, path, options = {}, retry = {}) {
       : `${name} not found. If the repo is private, set GITHUB_TOKEN.`,
     406: 'The diff is too large for the GitHub API.',
   };
-  throw new Error(`GitHub returned HTTP ${response.status}${hints[response.status] ? ` (${hints[response.status]})` : ''}: ${message}`);
+  const hint = hints[response.status] ? ` (${hints[response.status]})` : '';
+  throw Object.assign(new Error(`GitHub returned HTTP ${response.status}${hint}: ${message}`), { status: response.status });
 }

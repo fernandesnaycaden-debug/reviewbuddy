@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, mock, test } from 'node:test';
-import { getPullRequest, getPullRequestDiff, postReview } from '../src/github.js';
+import {
+  getCompareDiff, getPullRequest, getPullRequestDiff, listReviewComments, listReviews, postReview,
+} from '../src/github.js';
 
 const pr = { owner: 'o', repo: 'r', number: 12 };
 
@@ -33,6 +35,43 @@ test('getPullRequestDiff asks for a diff and sends no token when there is none',
   const { headers } = fetch.mock.calls[0].arguments[1];
   assert.equal(headers.Accept, 'application/vnd.github.diff');
   assert.equal('Authorization' in headers, false);
+});
+
+test('listReviews follows pages until one comes back short', async () => {
+  const page1 = Array.from({ length: 100 }, (_, i) => ({ id: i }));
+  const fetch = mockFetch(json(page1), json([{ id: 100 }]));
+  const reviews = await listReviews(pr, 'tok');
+  assert.equal(reviews.length, 101);
+  assert.equal(reviews.at(-1).id, 100);
+
+  const urls = fetch.mock.calls.map((c) => c.arguments[0]);
+  assert.deepEqual(urls, [
+    'https://api.github.com/repos/o/r/pulls/12/reviews?per_page=100&page=1',
+    'https://api.github.com/repos/o/r/pulls/12/reviews?per_page=100&page=2',
+  ]);
+});
+
+test('listReviewComments stops after one short page', async () => {
+  const fetch = mockFetch(json([{ id: 1, path: 'a.js', line: 2 }]));
+  assert.deepEqual(await listReviewComments(pr, 'tok'), [{ id: 1, path: 'a.js', line: 2 }]);
+  assert.equal(fetch.mock.calls[0].arguments[0], 'https://api.github.com/repos/o/r/pulls/12/comments?per_page=100&page=1');
+});
+
+test('getCompareDiff asks for the diff between two commits', async () => {
+  const fetch = mockFetch(new Response('diff --git a/x b/x'));
+  assert.equal(await getCompareDiff(pr, 'tok', 'old', 'new'), 'diff --git a/x b/x');
+
+  const [url, init] = fetch.mock.calls[0].arguments;
+  assert.equal(url, 'https://api.github.com/repos/o/r/compare/old...new');
+  assert.equal(init.headers.Accept, 'application/vnd.github.diff');
+});
+
+test('getCompareDiff returns null when the old commit is gone, and throws on other errors', async () => {
+  mockFetch(json({ message: 'Not Found' }, 404));
+  assert.equal(await getCompareDiff(pr, 'tok', 'old', 'new'), null);
+
+  mockFetch(json({ message: 'Forbidden' }, 403));
+  await assert.rejects(getCompareDiff(pr, 'tok', 'old', 'new'), /HTTP 403/);
 });
 
 test('postReview posts a comment review on the right side of the diff', async () => {

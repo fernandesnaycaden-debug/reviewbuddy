@@ -149,7 +149,25 @@ How the review looks on GitHub:
 - Each finding is an inline comment like **[SECURITY]** Hardcoded API key; load it from an environment variable.
 - The review summary says how many issues were found and which model found them. Findings that point at a line outside the diff can't be attached to that line, so they are listed in the summary instead.
 
-Every run posts a new review; earlier ones are not updated or removed.
+### Running it again on the same PR
+
+Each review ends with a hidden marker, `<!-- reviewbuddy:sha=... -->`, that records which commit it reviewed. On the next run reviewbuddy looks for the most recent review with that marker. It doesn't matter who posted it, so a personal token and the GitHub Actions bot share the same history.
+
+- **No new commits since then:** it prints `Already reviewed abc1234, nothing new` and stops. No model is called.
+- **New commits:** it reviews only the changes since the reviewed commit (GitHub's compare diff), limited to files the PR itself changes. The review summary says `since abc1234`.
+- **The reviewed commit is gone** (after a force-push or rebase): it says so and reviews the whole PR.
+- **A finding was already posted:** an inline comment from an earlier reviewbuddy review on the same file, line and severity is not posted again. The run prints how many it skipped.
+- **Nothing new to post:** no review is posted, not even an empty one. This includes a first run that finds no issues at all, so the next run reviews from the last commit that did get a review (or the whole PR, if none did).
+
+To ignore earlier reviews and review the whole PR again, add `--full`. Findings that are already posted are still skipped:
+
+```powershell
+npm run review -- https://github.com/owner/repo/pull/12 --full
+```
+
+`--dry-run` prints all of this too: which commit it would diff from, whether it fell back to a full review, how many findings it skipped, and the review it would post.
+
+Known limits: matching is by line number, so a finding whose code moved is posted again on its new line. If the base branch was merged into the PR, the incremental diff includes those changes in files the PR also touches. Findings that went into an earlier review's summary (lines outside the diff) are not checked for duplicates.
 
 ## Configuration
 
@@ -182,7 +200,7 @@ Network errors and HTTP 429/5xx responses from GitHub, Ollama and the cloud prov
 npm test
 ```
 
-The tests cover diff parsing, line numbering, chunking, the ignore list, reply parsing, retries and timeouts, the GitHub client, splitting findings between inline comments and the review body, the Markdown report, a full run with GitHub and Ollama mocked, and each cloud provider's requests, replies and errors (provider selection, missing keys, schema fallback, 401/404/429). They need neither Ollama, API keys nor network access.
+The tests cover diff parsing, line numbering, chunking, the ignore list, reply parsing, retries and timeouts, the GitHub client (including pagination and compare diffs), review markers and skipping findings already posted, re-runs (same commit, new commits, force-push fallback, `--full`), splitting findings between inline comments and the review body, the Markdown report, a full run with GitHub and Ollama mocked, and each cloud provider's requests, replies and errors (provider selection, missing keys, schema fallback, 401/404/429). They need neither Ollama, API keys nor network access.
 
 ## Expected output
 
@@ -226,3 +244,6 @@ Reviewing src/services/orders.js (1/1) ...
 | `GitHub returned HTTP 403` | The token doesn't have Pull requests: Read and write on that repo. |
 | `GitHub returned HTTP 404` | Check the PR URL. For a private repo, the token must include that repo. |
 | `GitHub returned HTTP 406` | The PR is too large for GitHub's diff API. Review it locally with `git diff` instead. |
+| `Already reviewed abc1234, nothing new` | Not an error: the PR's head commit already has a reviewbuddy review. Push new commits, or add `--full` to review it again. |
+| `Previous review's commit abc1234 no longer exists ... reviewing the whole PR` | The branch was force-pushed or rebased, so there's nothing to diff against. reviewbuddy reviews the whole PR instead; findings already posted are still skipped. |
+| `No new findings to post.` | Not an error: the new commits had no issues, or every finding was already posted. Nothing was posted. |
