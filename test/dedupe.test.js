@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { dropPosted, findingKey, latestMarkedReview, markerFor, parseMarker, postedKeys } from '../src/dedupe.js';
+import {
+  dropPosted, findingKey, latestMarkedReview, markerFor, openFindings, parseMarker, postedKeys,
+} from '../src/dedupe.js';
 
 const sha = '0123456789abcdef0123456789abcdef01234567';
 
@@ -42,6 +44,7 @@ test('postedKeys keeps current comments from our reviews only', () => {
     { pull_request_review_id: 1, path: 'a.js', line: 7, body: 'A reply without a severity' },
   ];
   assert.deepEqual(postedKeys(comments, new Set([1])), new Set([findingKey('a.js', 2, 'security')]));
+  assert.deepEqual(openFindings(comments, new Set([1])), [{ filename: 'a.js', line: 2, severity: 'security' }]);
 });
 
 test('dropPosted removes findings already posted and counts them', () => {

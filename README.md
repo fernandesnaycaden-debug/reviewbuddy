@@ -1,7 +1,7 @@
 # reviewbuddy
 AI code reviewer for GitHub PRs. Runs on local models (Ollama) or free cloud APIs.
 
-It reviews a GitHub pull request and posts its findings as inline review comments, or reviews a local diff file and prints them. Running automatically on every PR (a GitHub Action) comes later.
+It reviews a GitHub pull request and posts its findings as inline review comments, or reviews a local diff file and prints them. It can also [run on every pull request](#run-it-on-every-pull-request) as a GitHub Action.
 
 ## Requirements
 
@@ -123,6 +123,17 @@ npm run review -- changes.diff -o report.md
 
 The report includes a summary table, the model name, and per-file findings with severity badges. Every run overwrites the file.
 
+## Fail on certain findings
+
+Add `--fail-on` with comma-separated severities (`security`, `bug`, `performance`, `suggestion`) to exit with code 1 when any finding has one of them. The review is still printed (and posted, for a PR) first. This works for diff files and PRs, locally and in CI:
+
+```powershell
+npm run review -- changes.diff --fail-on security,bug
+$env:REVIEWBUDDY_FAIL_ON = "security"   # same thing, as a variable; the flag wins
+```
+
+On a pull request, a finding counts as long as it is still there, not just when it is new: findings from this run count even if they were already posted, and so do inline comments from earlier reviewbuddy reviews whose line hasn't changed since. Once the code under such a comment changes, GitHub marks it outdated and it stops counting. So pushing an unrelated commit doesn't make the check pass, but fixing the flagged line does.
+
 ## Review a GitHub pull request
 
 Pass the PR's URL instead of a diff file. reviewbuddy downloads the diff, reviews each file, and posts one review on the PR with a comment on each problem line.
@@ -169,6 +180,77 @@ npm run review -- https://github.com/owner/repo/pull/12 --full
 
 Known limits: matching is by line number, so a finding whose code moved is posted again on its new line. If the base branch was merged into the PR, the incremental diff includes those changes in files the PR also touches. Findings that went into an earlier review's summary (lines outside the diff) are not checked for duplicates.
 
+## Run it on every pull request
+
+reviewbuddy is also a GitHub Action. Add this file to the repo you want reviewed as `.github/workflows/reviewbuddy.yml`:
+
+```yaml
+name: reviewbuddy
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# A new push cancels the review still running for the previous one.
+concurrency:
+  group: reviewbuddy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: fernandesnaycaden-debug/reviewbuddy@v1
+        with:
+          provider: groq
+          api-key: ${{ secrets.GROQ_API_KEY }}
+          fail-on: security
+```
+
+Then add the API key as a secret: in the repo, go to **Settings → Secrets and variables → Actions → New repository secret**, name it `GROQ_API_KEY` (or whatever the workflow refers to) and paste the key. The workflow passes it to the action; it never appears in logs.
+
+Every time a PR is opened, gets new commits, is reopened or is marked ready for review, the action reviews it and posts a review just like the CLI does, including [reviewing only the new commits](#running-it-again-on-the-same-pr). Drafts are skipped. On top of that:
+
+- The full Markdown report appears on the run's summary page.
+- Each finding is also an annotation: `security` and `bug` as errors, `performance` and `suggestion` as warnings. They show on the run page and next to the code in the PR's **Files changed** tab.
+- With `fail-on`, the check fails when a finding of a listed severity is still in the PR (see [Fail on certain findings](#fail-on-certain-findings)).
+
+No checkout step is needed: the action downloads the PR's diff from the GitHub API.
+
+| Input | Default | Meaning |
+|-------|---------|---------|
+| `provider` | none (required) | `groq`, `openrouter`, `gemini` or `anthropic`. `ollama` works only with `OLLAMA_URL` set to a server the runner can reach |
+| `api-key` | none | API key for that provider; pass it from a secret |
+| `model` | the provider's default | Model to use, like that provider's `*_MODEL` variable |
+| `fail-on` | none | Comma-separated severities that fail the check, like `--fail-on` |
+| `ignore` | none | Extra comma-separated file patterns to skip, like `--ignore` |
+| `full` | `false` | `true` reviews the whole PR every time, like `--full` |
+| `timeout` | the provider's default | Seconds a single model request may take, like `--timeout` |
+| `github-token` | `${{ github.token }}` | Token used to read the PR and post the review |
+
+The action only runs on `pull_request` events; under any other trigger it stops with an error.
+
+### Pull requests from forks
+
+GitHub doesn't give workflows on pull requests from forks any secrets, and their `GITHUB_TOKEN` is read-only. Dependabot PRs are treated the same way. So for such a PR:
+
+- **No API key:** the action prints a warning that it skipped the review and passes. A maintainer can review the PR with the CLI instead.
+- **A key is available but the token is read-only:** the review runs and the findings appear in the run's summary and annotations, but the review can't be posted on the PR. The action warns about that instead of failing; `fail-on` still applies.
+
+### Block merging on findings
+
+1. Set `fail-on` in the workflow, for example `fail-on: security,bug`.
+2. Let the workflow run once on a PR, so GitHub knows the check.
+3. In **Settings → Branches** (or **Rules → Rulesets**), protect your main branch and add **Require status checks to pass**, choosing the `review` check.
+
+A PR with an open finding of a listed severity can then not be merged until the flagged line is fixed (or an admin bypasses the rule). A draft PR's skipped run doesn't block anything; the review runs once it is marked ready.
+
 ## Configuration
 
 | Variable       | Default                  | Meaning                    |
@@ -186,6 +268,7 @@ Known limits: matching is by line number, so a finding whose code moved is poste
 | `ANTHROPIC_MODEL` | `claude-opus-5-5`     | Claude model to use        |
 | `GITHUB_TOKEN` | none                     | Token used to read PRs and post reviews |
 | `REVIEWBUDDY_IGNORE` | none               | Extra comma-separated patterns to skip, like `--ignore` |
+| `REVIEWBUDDY_FAIL_ON` | none              | Comma-separated severities that make the run exit with code 1, like `--fail-on` |
 | `REVIEWBUDDY_TIMEOUT` | `600` (Ollama), `300` (cloud) | Seconds a single model request may take, like `--timeout`. `0` means no limit |
 
 Pass `--timeout <seconds>` to override `REVIEWBUDDY_TIMEOUT` for one run, for example `npm run review -- changes.diff --timeout 1200` for a slow model.
@@ -200,7 +283,7 @@ Network errors and HTTP 429/5xx responses from GitHub, Ollama and the cloud prov
 npm test
 ```
 
-The tests cover diff parsing, line numbering, chunking, the ignore list, reply parsing, retries and timeouts, the GitHub client (including pagination and compare diffs), review markers and skipping findings already posted, re-runs (same commit, new commits, force-push fallback, `--full`), splitting findings between inline comments and the review body, the Markdown report, a full run with GitHub and Ollama mocked, and each cloud provider's requests, replies and errors (provider selection, missing keys, schema fallback, 401/404/429). They need neither Ollama, API keys nor network access.
+The tests cover diff parsing, line numbering, chunking, the ignore list, reply parsing, retries and timeouts, the GitHub client (including pagination and compare diffs), review markers and skipping findings already posted, re-runs (same commit, new commits, force-push fallback, `--full`), splitting findings between inline comments and the review body, the Markdown report, `--fail-on` and exit codes, GitHub Actions annotations (and their escaping), the job summary, fork PRs without a key or with a read-only token, a full run with GitHub and Ollama mocked, and each cloud provider's requests, replies and errors (provider selection, missing keys, schema fallback, 401/404/429). They need neither Ollama, API keys nor network access.
 
 ## Expected output
 
@@ -247,3 +330,11 @@ Reviewing src/services/orders.js (1/1) ...
 | `Already reviewed abc1234, nothing new` | Not an error: the PR's head commit already has a reviewbuddy review. Push new commits, or add `--full` to review it again. |
 | `Previous review's commit abc1234 no longer exists ... reviewing the whole PR` | The branch was force-pushed or rebased, so there's nothing to diff against. reviewbuddy reviews the whole PR instead; findings already posted are still skipped. |
 | `No new findings to post.` | Not an error: the new commits had no issues, or every finding was already posted. Nothing was posted. |
+| `Unknown severity "..." in --fail-on` | Use only `bug`, `security`, `performance` and `suggestion`, separated by commas, in `--fail-on`, `REVIEWBUDDY_FAIL_ON` or the action's `fail-on` input. |
+| `Failing: 2 findings match --fail-on security` | Not a crash: findings of a severity you listed are still in the code, so the run exits with code 1. Fix the flagged lines, or change `--fail-on`. |
+| `Ollama doesn't run on GitHub-hosted runners` | Set the action's `provider` input to `groq`, `openrouter`, `gemini` or `anthropic` and pass its `api-key` from a secret. |
+| `Set GROQ_API_KEY ... In GitHub Actions, add the key as a repository secret` | The workflow didn't get a key. Add the secret (Settings → Secrets and variables → Actions) and check that `api-key:` names it exactly. |
+| `Skipping the review: GitHub doesn't pass secrets to workflows on pull requests from forks` | Only a warning: see [Pull requests from forks](#pull-requests-from-forks). |
+| `Could not post the review: on pull requests from forks the GitHub token is read-only` | Only a warning: the findings are on the run's summary page and in the annotations. |
+| `GitHub returned HTTP 403` in Actions on your own PR | The workflow lacks `permissions: pull-requests: write`. |
+| `reviewbuddy runs on pull_request events` | The workflow uses another trigger. Use `on: pull_request`, as in the example workflow. |

@@ -1,0 +1,29 @@
+# Reviews this repo's own pull requests with the action in this checkout (uses: ./).
+name: reviewbuddy
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# A new push cancels the review still running for the previous one. Nothing is lost:
+# the next run reviews everything since the last review that was actually posted.
+concurrency:
+  group: reviewbuddy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          provider: groq
+          api-key: ${{ secrets.GROQ_API_KEY }}
+          fail-on: security

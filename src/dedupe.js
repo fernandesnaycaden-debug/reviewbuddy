@@ -31,18 +31,23 @@ export function findingKey(path, line, severity) {
 }
 
 /**
- * Keys of the findings already posted as inline comments by our reviews (reviewIds).
- * Outdated comments have no current line, so they never match.
+ * Findings our reviews (reviewIds) posted as inline comments that still apply, as [{ filename, line, severity }].
+ * Outdated comments (the code under them changed) have no current line, so they are left out.
  */
-export function postedKeys(comments, reviewIds) {
-  const keys = new Set();
+export function openFindings(comments, reviewIds) {
+  const found = [];
   for (const c of comments) {
     const severity = c.body?.match(/^\*\*\[(\w+)\]\*\*/)?.[1];
     if (reviewIds.has(c.pull_request_review_id) && severity && c.line != null) {
-      keys.add(findingKey(c.path, c.line, severity));
+      found.push({ filename: c.path, line: c.line, severity: severity.toLowerCase() });
     }
   }
-  return keys;
+  return found;
+}
+
+/** Keys of the findings already posted as inline comments by our reviews (reviewIds). */
+export function postedKeys(comments, reviewIds) {
+  return new Set(openFindings(comments, reviewIds).map((f) => findingKey(f.filename, f.line, f.severity)));
 }
 
 /** Remove findings whose key is in keys. Returns { results, skipped }. */

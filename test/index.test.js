@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, mock, test } from 'node:test';
 import { markerFor } from '../src/dedupe.js';
-import { buildReview, formatReport, main, writeReport } from '../src/index.js';
+import { buildReview, formatReport, main, parseFailOn, writeReport } from '../src/index.js';
 
 const diff = [
   'diff --git a/src/a.js b/src/a.js',
@@ -30,13 +30,17 @@ const results = [
 ];
 
 let dir;
+let exitCode;
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), 'reviewbuddy-'));
+  exitCode = process.exitCode;
   mock.method(console, 'log', () => {});
   mock.method(console, 'warn', () => {});
 });
 afterEach(async () => {
   mock.restoreAll();
+  // --fail-on sets it; left at 1, it would fail this test file.
+  process.exitCode = exitCode;
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -108,8 +112,15 @@ function ollamaReply(comments) {
 }
 
 function withEnv(vars, fn) {
-  // Keep a provider set in the developer's shell from leaking in.
-  vars = { REVIEWBUDDY_PROVIDER: '', ...vars };
+  // Keep a provider set in the developer's shell, or the Actions run the tests are in, from leaking in.
+  vars = {
+    REVIEWBUDDY_PROVIDER: '',
+    REVIEWBUDDY_FAIL_ON: '',
+    GITHUB_ACTIONS: '',
+    GITHUB_STEP_SUMMARY: '',
+    GITHUB_EVENT_PATH: '',
+    ...vars,
+  };
   const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
   Object.assign(process.env, vars);
   return fn().finally(() => {
@@ -144,10 +155,10 @@ const compareDiff = [
 
 /**
  * Mock GitHub (PR 1 at HEAD, with the given reviews and review comments) and Ollama (replying with findings).
- * compare: the diff since the old commit, or null to answer 404.
+ * compare: the diff since the old commit, or null to answer 404. postStatus: answer the post with this error status.
  * Returns the posted review bodies, the requested URLs and the diffs sent to the model.
  */
-function fakeGitHub({ reviews = [], comments = [], compare = compareDiff, findings = [hardcodedKey] } = {}) {
+function fakeGitHub({ reviews = [], comments = [], compare = compareDiff, findings = [hardcodedKey], postStatus } = {}) {
   const calls = { posted: [], urls: [], reviewed: [] };
   mock.method(globalThis, 'fetch', async (url, init) => {
     calls.urls.push(url);
@@ -157,6 +168,7 @@ function fakeGitHub({ reviews = [], comments = [], compare = compareDiff, findin
     }
     const path = url.replace('https://api.github.com/repos/o/r/', '');
     if (init.method === 'POST') {
+      if (postStatus) return Response.json({ message: 'Resource not accessible by integration' }, { status: postStatus });
       calls.posted.push(JSON.parse(init.body));
       return Response.json({ html_url: 'https://github.com/o/r/pull/1#review' });
     }
@@ -302,3 +314,133 @@ test('main reviews a diff file and writes the report', () => withEnv({ OLLAMA_UR
 test('main refuses to post without a token', () => withEnv({ GITHUB_TOKEN: '' }, async () => {
   await assert.rejects(main(['https://github.com/o/r/pull/1']), /Set GITHUB_TOKEN/);
 }));
+
+test('parseFailOn reads comma-separated severities in any case', () => {
+  assert.deepEqual(parseFailOn('Security, bug,,security'), ['security', 'bug']);
+  assert.deepEqual(parseFailOn(''), []);
+  assert.deepEqual(parseFailOn(undefined), []);
+  assert.throws(() => parseFailOn('security,critical'), /Unknown severity "critical" in --fail-on\. Use a comma-separated list of: bug, security, performance, suggestion\./);
+});
+
+test('main rejects an unknown --fail-on severity before reviewing', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  const fetch = mock.method(globalThis, 'fetch', async () => assert.fail('nothing should be fetched'));
+  await assert.rejects(main(['changes.diff', '--fail-on', 'nope']), /Unknown severity "nope"/);
+  assert.equal(fetch.mock.callCount(), 0);
+}));
+
+/** Review a diff file whose model reply is one bug on line 2, with the given extra arguments. */
+async function reviewBugDiff(...args) {
+  mock.method(globalThis, 'fetch', async () => ollamaReply([{ line: 2, severity: 'bug', message: 'Unused key' }]));
+  const diffPath = join(dir, 'changes.diff');
+  await writeFile(diffPath, diff);
+  await main([diffPath, ...args]);
+}
+
+test('main --fail-on sets exit code 1 when a finding has a listed severity', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  await reviewBugDiff('--fail-on', 'security,bug');
+  assert.equal(process.exitCode, 1);
+  assert.match(logged(), /Failing: 1 finding match --fail-on security,bug\./);
+}));
+
+test('main --fail-on leaves the exit code alone when no finding matches', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  await reviewBugDiff('--fail-on', 'security');
+  assert.notEqual(process.exitCode, 1);
+  assert.doesNotMatch(logged(), /Failing/);
+}));
+
+test('REVIEWBUDDY_FAIL_ON works like --fail-on', () => withEnv({ OLLAMA_URL: 'http://ollama.test', REVIEWBUDDY_FAIL_ON: 'BUG' }, async () => {
+  await reviewBugDiff();
+  assert.equal(process.exitCode, 1);
+}));
+
+const postedKey = { pull_request_review_id: 1, path: 'src/a.js', line: 2, body: '**[SECURITY]** Hardcoded key' };
+
+test('main --fail-on counts a finding even when it was already posted', () => github(async () => {
+  const calls = fakeGitHub({ reviews: [{ id: 1, body: markerFor(OLD) }], comments: [postedKey] });
+
+  await main([PR_URL, '--fail-on', 'security']);
+
+  assert.equal(calls.posted.length, 0);
+  assert.equal(process.exitCode, 1);
+}));
+
+test('main --fail-on still fails on an earlier finding when the head was already reviewed', () => github(async () => {
+  const calls = fakeGitHub({ reviews: [{ id: 1, body: markerFor(HEAD) }], comments: [postedKey] });
+
+  await main([PR_URL, '--fail-on', 'security']);
+
+  assert.equal(calls.reviewed.length, 0);
+  assert.equal(process.exitCode, 1);
+}));
+
+test('main --fail-on ignores an earlier finding once its line changed', () => github(async () => {
+  fakeGitHub({ reviews: [{ id: 1, body: markerFor(HEAD) }], comments: [{ ...postedKey, line: null }] });
+
+  await main([PR_URL, '--fail-on', 'security']);
+
+  assert.notEqual(process.exitCode, 1);
+}));
+
+/** Write a pull_request event; fork: whether the head repo differs from the base. Returns its path. */
+async function eventFile(fork) {
+  const path = join(dir, 'event.json');
+  await writeFile(path, JSON.stringify({
+    pull_request: { head: { repo: { full_name: fork ? 'someone/r' : 'o/r' } }, base: { repo: { full_name: 'o/r' } } },
+  }));
+  return path;
+}
+
+const actions = (vars, fn) => withEnv({ GITHUB_TOKEN: 'tok', OLLAMA_URL: 'http://ollama.test', GITHUB_ACTIONS: 'true', ...vars }, fn);
+
+test('in Actions, main writes the report to the job summary and prints annotations', async () => {
+  const summary = join(dir, 'summary.md');
+  await actions({ GITHUB_STEP_SUMMARY: summary }, async () => {
+    fakeGitHub();
+    await main([PR_URL]);
+  });
+
+  const report = await readFile(summary, 'utf8');
+  assert.match(report, /^# 🔍 ReviewBuddy Report/);
+  assert.match(report, /\| 2 \| 🔴 \*\*SECURITY\*\* \| Hardcoded key \|/);
+  assert.match(logged(), /^::error file=src\/a\.js,line=2,title=reviewbuddy%3A SECURITY::Hardcoded key$/m);
+});
+
+test('in Actions, main refuses Ollama without OLLAMA_URL', () => actions({ OLLAMA_URL: '' }, async () => {
+  await assert.rejects(main([PR_URL]), /Ollama doesn't run on GitHub-hosted runners/);
+}));
+
+test('in Actions, a fork PR without an API key is skipped with a warning', async () => {
+  const path = await eventFile(true);
+  await actions({ REVIEWBUDDY_PROVIDER: 'groq', GROQ_API_KEY: '', GITHUB_EVENT_PATH: path }, async () => {
+    const fetch = mock.method(globalThis, 'fetch', async () => assert.fail('nothing should be fetched'));
+    await main([PR_URL, '--fail-on', 'security']);
+    assert.equal(fetch.mock.callCount(), 0);
+  });
+  assert.match(logged(), /^::warning::Skipping the review: GitHub doesn't pass secrets to workflows on pull requests from forks/m);
+  assert.notEqual(process.exitCode, 1);
+});
+
+test('in Actions, a missing API key on a same-repo PR is an error with a hint', async () => {
+  const path = await eventFile(false);
+  await actions({ REVIEWBUDDY_PROVIDER: 'groq', GROQ_API_KEY: '', GITHUB_EVENT_PATH: path }, async () => {
+    await assert.rejects(main([PR_URL]), /Set GROQ_API_KEY to use Groq[^]*add the key as a repository secret/);
+  });
+});
+
+test('in Actions, a 403 when posting on a fork PR is a warning, and --fail-on still applies', async () => {
+  const path = await eventFile(true);
+  await actions({ GITHUB_EVENT_PATH: path }, async () => {
+    fakeGitHub({ postStatus: 403 });
+    await main([PR_URL, '--fail-on', 'security']);
+  });
+  assert.match(logged(), /^::warning::Could not post the review: on pull requests from forks the GitHub token is read-only/m);
+  assert.equal(process.exitCode, 1);
+});
+
+test('a 403 when posting on a same-repo PR is still an error', async () => {
+  const path = await eventFile(false);
+  await actions({ GITHUB_EVENT_PATH: path }, async () => {
+    fakeGitHub({ postStatus: 403 });
+    await assert.rejects(main([PR_URL]), /GitHub returned HTTP 403/);
+  });
+});
