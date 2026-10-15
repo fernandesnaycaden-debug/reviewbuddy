@@ -3,8 +3,16 @@
   "version": "1.0.0",
   "description": "AI code reviewer for GitHub PRs. Runs on local models (Ollama) or free cloud APIs.",
   "main": "src/index.js",
+  "bin": {
+    "reviewbuddy": "bin/reviewbuddy.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "samples"
+  ],
   "scripts": {
-    "review": "node src/index.js",
+    "review": "node bin/reviewbuddy.js",
     "test": "node --test"
   },
   "repository": {

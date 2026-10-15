@@ -54,13 +54,14 @@ const RETRY_NOTE = '\n\nYour previous reply was not valid JSON in the required s
 /**
  * Review a unified diff and return a list of { line, severity, message } comments.
  * Big diffs are reviewed in pieces. Comments on lines that weren't added are dropped.
+ * timeoutMs limits each model request (undefined = the provider's default).
  */
-export async function reviewDiff(filename, diff) {
+export async function reviewDiff(filename, diff, { timeoutMs } = {}) {
   const chunks = chunkDiff(diff, MAX_CHUNK_CHARS);
   const comments = [];
   for (const [i, chunk] of chunks.entries()) {
     if (chunks.length > 1) console.log(`  part ${i + 1}/${chunks.length} ...`);
-    comments.push(...await reviewChunk(filename, chunk));
+    comments.push(...await reviewChunk(filename, chunk, timeoutMs));
   }
 
   const added = addedLines(diff);
@@ -71,11 +72,11 @@ export async function reviewDiff(filename, diff) {
   return kept;
 }
 
-async function reviewChunk(filename, diff) {
+async function reviewChunk(filename, diff, timeoutMs) {
   const userPrompt = `File: ${filename}\n\n${numberDiffLines(diff)}`;
 
   for (let attempt = 1; attempt <= 2; attempt++) {
-    const reply = await chat(SYSTEM_PROMPT, attempt === 1 ? userPrompt : userPrompt + RETRY_NOTE, COMMENTS_SCHEMA);
+    const reply = await chat(SYSTEM_PROMPT, attempt === 1 ? userPrompt : userPrompt + RETRY_NOTE, COMMENTS_SCHEMA, { timeoutMs });
     const comments = parseComments(reply);
     if (comments) return comments;
     if (attempt === 1) console.warn('Warning: model returned invalid JSON, retrying once...');

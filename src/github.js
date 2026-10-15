@@ -1,6 +1,9 @@
 // GitHub REST API client: fetches a pull request's diff and posts a review on it.
 
+import { fetchWithRetry } from './http.js';
+
 const API_URL = 'https://api.github.com';
+const TIMEOUT_MS = 30_000;
 
 /**
  * Parse "https://github.com/owner/repo/pull/12" into { owner, repo, number }.
@@ -41,11 +44,16 @@ export async function postReview(pr, token, { commitId, body, comments }) {
       body,
       comments: comments.map((c) => ({ ...c, side: 'RIGHT' })),
     }),
+  }, {
+    // A dropped connection or a 5xx may come after GitHub created the review,
+    // and retrying would post it twice. A 429 means it was never processed.
+    retryNetworkErrors: false,
+    retryStatuses: [429],
   });
   return response.json();
 }
 
-async function request(pr, token, path, options = {}) {
+async function request(pr, token, path, options = {}, retry = {}) {
   const url = `${API_URL}/repos/${pr.owner}/${pr.repo}/${path}`;
   const headers = {
     Accept: 'application/vnd.github+json',
@@ -57,8 +65,9 @@ async function request(pr, token, path, options = {}) {
 
   let response;
   try {
-    response = await fetch(url, { ...options, headers });
+    response = await fetchWithRetry(url, { ...options, headers }, { label: 'GitHub', timeoutMs: TIMEOUT_MS, ...retry });
   } catch (err) {
+    if (err.name === 'TimeoutError') throw new Error(`GitHub did not respond within ${TIMEOUT_MS / 1000}s.`);
     throw new Error(`Request to GitHub failed: ${err.cause?.message || err.message}`);
   }
   if (response.ok) return response;

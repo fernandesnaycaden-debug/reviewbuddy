@@ -10,7 +10,16 @@ It reviews a GitHub pull request and posts its findings as inline review comment
 
 No `npm install` is needed: the project has no dependencies.
 
-## Run it
+## Run it without cloning
+
+```powershell
+npx reviewbuddy https://github.com/owner/repo/pull/12 --dry-run
+npx reviewbuddy changes.diff
+```
+
+Until the package is on npm, run it straight from GitHub instead: `npx github:fernandesnaycaden-debug/reviewbuddy <pr-url or diff>`. Every option below works the same way; just swap `npm run review --` for `npx reviewbuddy`.
+
+## Run it from a clone
 
 ```powershell
 git clone https://github.com/fernandesnaycaden-debug/reviewbuddy.git
@@ -98,6 +107,11 @@ Every run posts a new review; earlier ones are not updated or removed.
 | `OLLAMA_URL`   | `http://localhost:11434` | Where Ollama is listening  |
 | `GITHUB_TOKEN` | none                     | Token used to read PRs and post reviews |
 | `REVIEWBUDDY_IGNORE` | none               | Extra comma-separated patterns to skip, like `--ignore` |
+| `REVIEWBUDDY_TIMEOUT` | `600`             | Seconds a single model request may take, like `--timeout`. `0` means no limit |
+
+Pass `--timeout <seconds>` to override `REVIEWBUDDY_TIMEOUT` for one run, for example `npm run review -- changes.diff --timeout 1200` for a slow model.
+
+Network errors and HTTP 429/5xx responses from GitHub and Ollama are retried up to 3 times with backoff (1s, 2s, 4s, or whatever `Retry-After` asks for). Posting the review is only retried after a 429, so a PR never gets the same review twice. GitHub requests time out after 30 seconds.
 
 ## Tests
 
@@ -105,12 +119,11 @@ Every run posts a new review; earlier ones are not updated or removed.
 npm test
 ```
 
-The tests cover diff parsing, line numbering, chunking, the ignore list and reply parsing. They don't need Ollama.
+The tests cover diff parsing, line numbering, chunking, the ignore list, reply parsing, retries and timeouts, the GitHub client, splitting findings between inline comments and the review body, the Markdown report, and a full run with GitHub and Ollama mocked. They need neither Ollama nor network access.
 
 ## Expected output
 
 The sample [samples/buggy.diff](samples/buggy.diff) contains three planted bugs:
-Adding a bin entry for installation 
 | Line | Bug |
 |------|-----|
 | 4    | Hardcoded API key |
@@ -135,7 +148,8 @@ Reviewing src/services/orders.js (1/1) ...
 | `Could not connect to Ollama` | Start Ollama (open the app, or run `ollama serve`). |
 | `Ollama returned HTTP 404 ... isn't installed` | `OLLAMA_MODEL` isn't set to a model you have. Check `ollama list`. |
 | `model returned invalid JSON` | The model replied with something that isn't JSON. It retries once; if it fails again, try a larger model. |
-| `Request to Ollama ... failed` after ~5 minutes | The model is too slow on this machine. Try a smaller model. |
+| `Ollama didn't finish within 600s` | The model is too slow on this machine. Try a smaller model, or raise `--timeout`. |
+| `... retrying in 2.0s (1/3)` | A network error or a busy server. reviewbuddy retries on its own; it only fails if every retry does. |
 | `Set GITHUB_TOKEN to post a review` | Set `$env:GITHUB_TOKEN`, or add `--dry-run`. |
 | `GitHub returned HTTP 401` | The token is wrong or expired. Create a new one. |
 | `GitHub returned HTTP 403` | The token doesn't have Pull requests: Read and write on that repo. |
