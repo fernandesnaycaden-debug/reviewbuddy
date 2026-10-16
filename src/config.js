@@ -6,6 +6,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { getFileContent } from './github.js';
 import { DEFAULT_IGNORE, parsePatterns } from './ignore.js';
+import { FORMATS, parseFormat } from './output.js';
 import { modelVarFor, PROVIDER_NAMES } from './providers/index.js';
 import { SEVERITIES, SEVERITY_ORDER } from './review.js';
 
@@ -57,11 +58,17 @@ const FIELDS = {
     }
     return { timeoutMs: value * 1000 };
   },
+  format(value, where) {
+    if (typeof value !== 'string' || !FORMATS.includes(value.toLowerCase())) {
+      throw new Error(`${where} must be one of: ${FORMATS.join(', ')}.`);
+    }
+    return { format: value.toLowerCase() };
+  },
 };
 
 /**
  * Parse and validate .reviewbuddy.json. label names the file in errors.
- * Returns { provider?, model?, ignore?, defaultIgnore?, minSeverity?, failOn?, timeoutMs? }.
+ * Returns { provider?, model?, ignore?, defaultIgnore?, minSeverity?, failOn?, timeoutMs?, format? }.
  * Unknown keys are warned about and skipped; anything that looks like a secret is an error.
  */
 export function parseConfig(text, label = CONFIG_FILE) {
@@ -215,6 +222,7 @@ export function resolveSettings({ flags = {}, env = {}, file = {} }) {
   const failOn = given(flags, env, 'fail-on', 'REVIEWBUDDY_FAIL_ON');
   const minSeverity = given(flags, env, 'min-severity', 'REVIEWBUDDY_MIN_SEVERITY');
   const timeout = given(flags, env, 'timeout', 'REVIEWBUDDY_TIMEOUT');
+  const format = given(flags, env, 'format', 'REVIEWBUDDY_FORMAT');
   const defaultIgnore = flags['no-default-ignore'] ? false : file.defaultIgnore ?? true;
 
   return {
@@ -224,6 +232,8 @@ export function resolveSettings({ flags = {}, env = {}, file = {} }) {
     failOn: failOn ? parseFailOn(failOn.value, failOn.label) : file.failOn ?? [],
     minSeverity: minSeverity ? parseMinSeverity(minSeverity.value, minSeverity.label) : file.minSeverity,
     timeoutMs: timeout ? parseTimeout(timeout.value, timeout.label) : file.timeoutMs,
+    // undefined: --output's extension decides, else text.
+    format: format ? parseFormat(format.value, format.label) : file.format,
     defaultIgnore,
     ignorePatterns: [
       ...(defaultIgnore ? DEFAULT_IGNORE : []),

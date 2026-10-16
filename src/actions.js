@@ -1,6 +1,7 @@
 // Helpers for running inside GitHub Actions: workflow-command annotations, the job summary, and fork detection.
 
 import { appendFile, readFile } from 'node:fs/promises';
+import { info } from './log.js';
 
 /** True when running as a GitHub Actions step. */
 export function inActions() {
@@ -39,7 +40,7 @@ export function annotationsFor(results) {
 
 /** Print a warning that shows on the run page. */
 export function warning(message) {
-  console.log(annotation('warning', message));
+  info(annotation('warning', message));
 }
 
 /** Append Markdown to the job summary ($GITHUB_STEP_SUMMARY). Does nothing outside Actions. */

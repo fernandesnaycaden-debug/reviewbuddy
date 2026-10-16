@@ -1,7 +1,7 @@
 # reviewbuddy
 AI code reviewer for GitHub PRs. Runs on local models (Ollama) or free cloud APIs.
 
-It reviews a GitHub pull request and posts its findings as inline review comments, or reviews a local diff file and prints them. It can also [run on every pull request](#run-it-on-every-pull-request) as a GitHub Action.
+It reviews a GitHub pull request and posts its findings as inline review comments, or reviews your local git changes (or a diff file, or a diff on stdin) and prints them. Results can also be written as [JSON or SARIF](#output-formats) for other tools. It can also [run on every pull request](#run-it-on-every-pull-request) as a GitHub Action, and upload its findings to [Code Scanning](#upload-findings-to-code-scanning).
 
 ## Requirements
 
@@ -15,11 +15,12 @@ No `npm install` is needed: the project has no dependencies.
 ## Run it without cloning
 
 ```powershell
+npx reviewbuddy --staged                 # in your project: review what you're about to commit
 npx reviewbuddy https://github.com/owner/repo/pull/12 --dry-run
 npx reviewbuddy changes.diff
 ```
 
-Until the package is on npm, run it straight from GitHub instead: `npx github:fernandesnaycaden-debug/reviewbuddy <pr-url or diff>`. Every option below works the same way; just swap `npm run review --` for `npx reviewbuddy`.
+Until the package is on npm, run it straight from GitHub instead: `npx github:fernandesnaycaden-debug/reviewbuddy <flags, pr-url or diff>`. Every option below works the same way; just swap `npm run review --` for `npx reviewbuddy`.
 
 ## Run it from a clone
 
@@ -34,7 +35,7 @@ npm run review
 
 `$env:OLLAMA_MODEL` only lasts for the current PowerShell window. On macOS/Linux use `OLLAMA_MODEL=qwen2.5-coder:7b npm run review`.
 
-To review a different diff: `npm run review -- path/to/file.diff`
+With no arguments it reviews the sample [samples/buggy.diff](samples/buggy.diff). To review your own work, see [Review your own changes](#review-your-own-changes).
 
 ## Choose a provider
 
@@ -88,18 +89,51 @@ reviewbuddy asks each provider for replies that match a JSON schema. If a model 
 
 ## Review your own changes
 
-Make a diff in the project you want reviewed, then point reviewbuddy at it. A diff can touch any number of files; each file is reviewed separately.
+Tell reviewbuddy which changes to review, and it runs `git diff` itself. No diff file needed:
+
+| Flag | Reviews | Same as |
+|------|---------|---------|
+| `--staged` | What you're about to commit | `git diff --cached` |
+| `--uncommitted` | Everything not committed yet, staged or not | `git diff HEAD` |
+| `--branch <base>` | Every commit on the current branch since it left `<base>` | `git diff <base>...HEAD` |
+| `--since <rev>` | Every commit since `<rev>` (a commit, tag or branch) | `git diff <rev> HEAD` |
 
 ```powershell
 cd C:\path\to\your-project
-git diff --output=changes.diff                 # uncommitted changes
-git diff main...my-branch --output=changes.diff  # everything on a branch
+npx reviewbuddy --staged
+npx reviewbuddy --branch main
+npx reviewbuddy --since HEAD~3
 
-cd C:\path\to\reviewbuddy
-npm run review -- C:\path\to\your-project\changes.diff
+# From the reviewbuddy clone instead, point --repo-dir at the project:
+npm run review -- --uncommitted --repo-dir C:\path\to\your-project
 ```
 
-Use `--output=` rather than `git diff > changes.diff`: in Windows PowerShell 5.1, `>` writes UTF-16, which reviewbuddy can't read.
+Use only one of these at a time, and not together with a diff file or PR URL. git runs in `--repo-dir` (or the current directory, or any subdirectory of the repo) and must be on your `PATH`. `--branch` and `--since` only see commits, so commit first or use `--uncommitted`. If there is nothing to review, reviewbuddy says so (`Nothing to review: no staged changes ...`) and exits with code 1.
+
+A diff can touch any number of files; each file is reviewed separately.
+
+Known limits:
+
+- **New files that git doesn't track yet don't show up** in `--uncommitted` (git diff ignores untracked files). Stage them, or run `git add -N <file>` to make git include them without staging their content.
+- `--uncommitted`, `--branch` and `--since` need at least one commit.
+- Binary files and submodule changes have no added lines to review, so they are skipped.
+
+### Diff files and stdin
+
+You can still review a diff file, from git or any other tool (`diff -u` output works too):
+
+```powershell
+git diff --output=changes.diff
+npm run review -- changes.diff
+```
+
+Or pipe a diff in, and pass `-` as the target:
+
+```bash
+git diff main...HEAD -- src/ | npx reviewbuddy -
+```
+
+Diff files and stdin can be UTF-8 (with or without a byte order mark) or UTF-16 with a byte order mark. So `git diff > changes.diff` in Windows PowerShell 5.1, which writes UTF-16, works now. **One catch in PowerShell 5.1:** piping (`git diff | npx reviewbuddy -`) re-encodes the text using `$OutputEncoding`, which is ASCII by default, so non-ASCII characters (accents, emoji, CJK) reach reviewbuddy as `?`. In PowerShell, use the git flags above or a diff file instead. PowerShell 7 and bash pipe UTF-8 unchanged.
 
 Files with no added lines (deleted files, pure renames, binary files) are skipped. So are files that aren't worth a model's time: lockfiles (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`), `*.min.*`, `*.map`, `*.snap`, `*.svg`, and anything under `dist/`, `build/`, `vendor/` or `node_modules/`.
 
@@ -117,7 +151,8 @@ Large files are reviewed in several parts so they fit in the model's context win
 A diff alone hides a lot: a value that looks unchecked may be validated a few lines above the hunk, and a function that looks undefined may be defined further down. So besides the diff, reviewbuddy sends the model the new version of each changed file, in a separate section marked as reference only. The model is told to use it to check whether the surrounding code already handles a problem, and never to comment on lines outside the diff (comments on other lines are dropped anyway).
 
 - **Pull requests:** each changed file is downloaded at the PR's head commit. Fine-grained tokens need **Contents: Read** for this. Without it, reviewbuddy warns and reviews that file from the diff alone.
-- **Diff files:** each changed file is read from the current directory, or from `--repo-dir` if you pass one. Use it when you run reviewbuddy from somewhere other than the project:
+- **Git flags:** each changed file is read in the version the diff's new side comes from, so the context always matches what is being reviewed: the staged version (`git show :path`) for `--staged`, the working tree for `--uncommitted`, and the last commit (`git show HEAD:path`) for `--branch` and `--since`. Paths are relative to the repo's top level, wherever in the repo you run it.
+- **Diff files and stdin:** each changed file is read from the current directory, or from `--repo-dir` if you pass one. Use it when you run reviewbuddy from somewhere other than the project:
 
   ```powershell
   npm run review -- C:\path\to\your-project\changes.diff --repo-dir C:\path\to\your-project
@@ -136,16 +171,66 @@ The context has to fit in a per-provider budget for the whole prompt, so the mod
 
 More context means more input tokens per request: up to the budget above, usually far less, since most files are a few thousand characters. On free tiers that can bring rate limits sooner; on Anthropic it costs more per review.
 
-## Save the results to a file
+## Output formats
 
-Add `--output` (or `-o`) to write a formatted Markdown report alongside the terminal output:
+`--format` picks how the results are written: `text` (the default), `json` or `sarif`. It can also come from `REVIEWBUDDY_FORMAT` or `"format"` in [`.reviewbuddy.json`](#configure-per-repository).
+
+| Format | Without `--output` | With `--output <file>` | Use it for |
+|--------|--------------------|------------------------|------------|
+| `text` | Findings printed to the terminal | A Markdown report as well | Reading the review yourself |
+| `json` | The JSON document on stdout, nothing else | The JSON document in the file | Scripts, editor plugins, dashboards |
+| `sarif` | The SARIF log on stdout, nothing else | The SARIF log in the file | GitHub Code Scanning and other SARIF viewers |
+
+Without `--format`, `--output`'s extension decides: `.json` writes JSON, `.sarif` writes SARIF, anything else (like `.md`) writes the Markdown report. `--format` wins over the extension.
 
 ```powershell
-npm run review -- --output review-report.md
-npm run review -- changes.diff -o report.md
+npm run review -- --staged -o review-report.md          # Markdown report
+npx reviewbuddy --branch main -o results.sarif           # SARIF, from the extension
+npx reviewbuddy --staged --format json > review.json     # JSON on stdout
 ```
 
-The report includes a summary table, the model name, and per-file findings with severity badges. Every run overwrites the file.
+When JSON or SARIF goes to stdout, **stdout holds only that document**: progress, findings and warnings all go to stderr, so `reviewbuddy ... --format json | jq .summary` works. Every run overwrites the `--output` file. `--min-severity` and `--fail-on` work the same in every format: dropped findings are left out of the document, and the exit code is 1 when `--fail-on` matches, after the document is written. A run with nothing to review still writes a valid, empty document.
+
+The Markdown report includes a summary table, the model name, and per-file findings with severity badges.
+
+### JSON
+
+```json
+{
+  "schemaVersion": 1,
+  "tool": { "name": "reviewbuddy", "version": "1.0.0" },
+  "provider": "groq",
+  "model": "openai/gpt-oss-20b",
+  "durationSeconds": 14.2,
+  "summary": { "files": 1, "findings": 2 },
+  "files": [
+    {
+      "path": "src/services/orders.js",
+      "findings": [
+        { "line": 4, "severity": "security", "message": "Hardcoded API key; load it from an environment variable.", "suggestion": "const API_KEY = process.env.API_KEY;" },
+        { "line": 22, "severity": "bug", "message": "Off-by-one: `<=` reads past the end of the array." }
+      ]
+    }
+  ]
+}
+```
+
+- `schemaVersion` changes only when a field is removed or changes meaning. New fields can appear without a bump, so ignore keys you don't know.
+- `path` is relative to the repository root, as in the diff. `line` is the line in the new version of the file.
+- `severity` is `security`, `bug`, `performance` or `suggestion`. `suggestion` (a one-line replacement for that line) and `endLine` are only there when there is one.
+- `files` lists every reviewed file, including ones with no findings.
+
+### SARIF
+
+`--format sarif` writes a [SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html) log with one run. There is one rule per severity (`reviewbuddy/security`, `reviewbuddy/bug`, `reviewbuddy/performance`, `reviewbuddy/suggestion`), and each finding is a result with that rule, a repo-relative file URI and its line:
+
+| Severity | SARIF level |
+|----------|-------------|
+| `security`, `bug` | `error` |
+| `performance` | `warning` |
+| `suggestion` | `note` |
+
+A suggested fix is added to the result's message as `Suggested fix: ...`. To see the results on GitHub, see [Upload findings to Code Scanning](#upload-findings-to-code-scanning).
 
 ## Fail on certain findings
 
@@ -286,7 +371,10 @@ No checkout step is needed: the action downloads the PR's diff and the changed f
 | `full` | `false` | `true` reviews the whole PR every time, like `--full` |
 | `timeout` | the provider's default | Seconds a single model request may take, like `--timeout` |
 | `config` | `true` | `false` ignores the repo's `.reviewbuddy.json` and `.reviewbuddy.md`, like `--no-config` |
+| `sarif-file` | none | Also write the findings as SARIF to this path, for [Code Scanning](#upload-findings-to-code-scanning). Implies `full` |
 | `github-token` | `${{ github.token }}` | Token used to read the PR and post the review |
+
+The action has one output, `sarif-file`: the SARIF file's path when `sarif-file` was set and the file was written, empty otherwise.
 
 The action also reads the repo's [`.reviewbuddy.json` and `.reviewbuddy.md`](#configure-per-repository) from the PR's base branch. A non-empty input overrides the same setting in the file; an empty one leaves the file's value in place.
 
@@ -306,6 +394,52 @@ GitHub doesn't give workflows on pull requests from forks any secrets, and their
 3. In **Settings → Branches** (or **Rules → Rulesets**), protect your main branch and add **Require status checks to pass**, choosing the `review` check.
 
 A PR with an open finding of a listed severity can then not be merged until the flagged line is fixed (or an admin bypasses the rule). A draft PR's skipped run doesn't block anything; the review runs once it is marked ready.
+
+### Upload findings to Code Scanning
+
+Set `sarif-file` and add an upload step, and the findings also show up as Code Scanning alerts: in the PR's checks and **Files changed** tab, and under **Security → Code scanning**.
+
+```yaml
+name: reviewbuddy
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write   # needed to upload SARIF
+
+jobs:
+  review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Lets the upload match alerts to the source files.
+      - uses: actions/checkout@v4
+      - id: reviewbuddy
+        uses: fernandesnaycaden-debug/reviewbuddy@v1
+        with:
+          provider: groq
+          api-key: ${{ secrets.GROQ_API_KEY }}
+          fail-on: security
+          sarif-file: reviewbuddy.sarif
+      - uses: github/codeql-action/upload-sarif@v3
+        # Also after fail-on fails the review step, but not when the review was skipped.
+        if: ${{ always() && steps.reviewbuddy.outputs.sarif-file != '' }}
+        with:
+          sarif_file: ${{ steps.reviewbuddy.outputs.sarif-file }}
+          category: reviewbuddy
+```
+
+- The job needs **`security-events: write`** to upload.
+- Code Scanning is free on public repositories. On **private repositories it requires GitHub Advanced Security** (GitHub Code Security); without it, the upload step fails, though the review itself still runs and posts.
+- Code Scanning treats each upload as the complete list for the PR, and closes alerts that are missing from it. So `sarif-file` implies `full`: every run reviews the whole PR, not just the new commits, which means more model calls per push. Findings that are already posted as comments are still not posted again.
+- On a fork PR without an API key the review is skipped, no file is written, the output stays empty, and the upload step is skipped too.
+
+The CLI writes the same file locally with `--format sarif` or `-o results.sarif`, for VS Code's SARIF Viewer or any other SARIF tool.
 
 ## Configure per repository
 
@@ -338,6 +472,7 @@ Both are optional, and a missing file is not an error. [examples/](examples/) ha
 | `minSeverity` | string | `--min-severity`, `REVIEWBUDDY_MIN_SEVERITY` | Least serious severity to report |
 | `failOn` | array of strings | `--fail-on`, `REVIEWBUDDY_FAIL_ON` | Severities that make the run exit with code 1 (fail the check) |
 | `timeout` | number | `--timeout`, `REVIEWBUDDY_TIMEOUT` | Seconds a single model request may take, `0` for no limit |
+| `format` | string | `--format`, `REVIEWBUDDY_FORMAT` | `text`, `json` or `sarif`; see [Output formats](#output-formats) |
 
 The file must be plain JSON (no comments, no trailing commas). A syntax error or a wrong type stops the run with a message naming the file and the key. An unknown key only prints a warning, so a typo like `"failon"` shows up in the log.
 
@@ -405,10 +540,18 @@ These variables override the reviewed repo's [`.reviewbuddy.json`](#configure-pe
 | `REVIEWBUDDY_FAIL_ON` | none              | Comma-separated severities that make the run exit with code 1, like `--fail-on` |
 | `REVIEWBUDDY_MIN_SEVERITY` | none (report everything) | Least serious severity to report (`security` > `bug` > `performance` > `suggestion`), like `--min-severity` |
 | `REVIEWBUDDY_TIMEOUT` | `600` (Ollama), `300` (cloud) | Seconds a single model request may take, like `--timeout`. `0` means no limit |
+| `REVIEWBUDDY_FORMAT` | `text` (or from `--output`'s extension) | `text`, `json` or `sarif`, like `--format` |
 
 Pass `--timeout <seconds>` to override `REVIEWBUDDY_TIMEOUT` for one run, for example `npm run review -- changes.diff --timeout 1200` for a slow model.
 
-For diff files, `--repo-dir <path>` says where to read the changed files for [full-file context](#full-file-context). It defaults to the current directory and has no variable.
+`--repo-dir <path>` says which repository the git flags run in, and where diff files and stdin read the changed files for [full-file context](#full-file-context). It defaults to the current directory and has no variable.
+
+| Flag | Meaning |
+|------|---------|
+| `--staged`, `--uncommitted`, `--branch <base>`, `--since <rev>` | Review local git changes; see [Review your own changes](#review-your-own-changes) |
+| `-` (as the target) | Read the diff from stdin |
+| `--format text\|json\|sarif` | How to write the results; see [Output formats](#output-formats) |
+| `--output <file>`, `-o` | Write the results to a file instead of (JSON, SARIF) or as well as (text) the terminal |
 
 With the default Claude models (Opus 5.5, Sonnet 5.5, Opus 5, Fable 5.1), reviewbuddy turns on Anthropic's server-side refusal fallback. If a safety classifier declines to review a piece of code, another Claude model finishes the request. A piece that is still declined, or that Gemini blocks, is skipped with a warning.
 
@@ -420,7 +563,7 @@ Network errors and HTTP 429/5xx responses from GitHub, Ollama and the cloud prov
 npm test
 ```
 
-The tests cover diff parsing, line numbering, chunking, the ignore list, reply parsing, full-file context (the full file, the windows around each hunk, the budget cutoff, files that don't match the diff, fetching files at the head commit, `--repo-dir` and paths outside it), `--min-severity` and how it interacts with `--fail-on`, suggested fixes (parsing, validation, indentation, the suggestion block in posted comments, the report's Fix line), each provider's prompt budget, retries and timeouts, the GitHub client (including pagination and compare diffs), review markers and skipping findings already posted, re-runs (same commit, new commits, force-push fallback, `--full`), splitting findings between inline comments and the review body, the Markdown report, `--fail-on` and exit codes, GitHub Actions annotations (and their escaping), the job summary, fork PRs without a key or with a read-only token, a full run with GitHub and Ollama mocked, per-repository config (validation, secret rejection, unknown keys, which value wins for each setting, ignore-pattern merging, finding the files up to the git root, reading them from the PR's base commit, `--no-config`, the rules cap and its effect on the context budget, and the prompt staying unchanged without rules), and each cloud provider's requests, replies and errors (provider selection, missing keys, schema fallback, 401/404/429). They need neither Ollama, API keys nor network access.
+The tests cover diff parsing, line numbering, chunking, the ignore list, reply parsing, full-file context (the full file, the windows around each hunk, the budget cutoff, files that don't match the diff, fetching files at the head commit, `--repo-dir` and paths outside it), `--min-severity` and how it interacts with `--fail-on`, suggested fixes (parsing, validation, indentation, the suggestion block in posted comments, the report's Fix line), each provider's prompt budget, retries and timeouts, the GitHub client (including pagination and compare diffs), review markers and skipping findings already posted, re-runs (same commit, new commits, force-push fallback, `--full`), splitting findings between inline comments and the review body, the Markdown report, `--fail-on` and exit codes, GitHub Actions annotations (and their escaping), the job summary, fork PRs without a key or with a read-only token, a full run with GitHub and Ollama mocked, per-repository config (validation, secret rejection, unknown keys, which value wins for each setting, ignore-pattern merging, finding the files up to the git root, reading them from the PR's base commit, `--no-config`, the rules cap and its effect on the context budget, and the prompt staying unchanged without rules), each cloud provider's requests, replies and errors (provider selection, missing keys, schema fallback, 401/404/429), the git flags (the git arguments for each mode, rejecting revisions that start with `-`, missing git, not a repository, unknown revisions, nothing to review, and, in temporary git repositories, that each mode reads its context from the index, the working tree or HEAD), reading stdin, UTF-8 byte order marks and UTF-16 diffs, choosing the format from `--format` or the extension, stdout holding only the document in JSON and SARIF modes (checked by running the CLI in a child process), the JSON document's shape, and the SARIF log's structure and level mapping (checked by hand against the essentials of the 2.1.0 schema). They need neither Ollama, API keys nor network access; the git tests are skipped if git isn't installed.
 
 ## Expected output
 
@@ -483,7 +626,7 @@ The first run can't see `getUser`, so models often flag line 41 as a possible nu
 | `GitHub returned HTTP 401` | The token is wrong or expired. Create a new one. |
 | `GitHub returned HTTP 403` | The token doesn't have Pull requests: Read and write on that repo. |
 | `GitHub returned HTTP 404` | Check the PR URL. For a private repo, the token must include that repo. |
-| `GitHub returned HTTP 406` | The PR is too large for GitHub's diff API. Review it locally with `git diff` instead. |
+| `GitHub returned HTTP 406` | The PR is too large for GitHub's diff API. Check out its branch and review it locally with `--branch <base>` instead. |
 | `Already reviewed abc1234, nothing new` | Not an error: the PR's head commit already has a reviewbuddy review. Push new commits, or add `--full` to review it again. |
 | `Previous review's commit abc1234 no longer exists ... reviewing the whole PR` | The branch was force-pushed or rebased, so there's nothing to diff against. reviewbuddy reviews the whole PR instead; findings already posted are still skipped. |
 | `No new findings to post.` | Not an error: the new commits had no issues, or every finding was already posted. Nothing was posted. |
@@ -493,6 +636,16 @@ The first run can't see `getUser`, so models often flag line 41 as a possible nu
 | `Could not fetch ... for context ... The token needs "Contents: Read"` | Only a warning: that file is reviewed from the diff alone. Give the token Contents → Read access. |
 | `... doesn't match the diff (another version checked out?)` | Only a warning: the local file isn't the diff's new version. Check out the branch the diff came from, or point `--repo-dir` at it. |
 | `--repo-dir ... is not a directory` | Check the path passed to `--repo-dir`. |
+| `Review one thing at a time` | Pass only one of `--staged`, `--uncommitted`, `--branch`, `--since`, a diff file, a PR URL or `-`. |
+| `git isn't installed, or isn't on PATH` | Install [git](https://git-scm.com/), or review a diff file instead. |
+| `... is not inside a git repository` | Run reviewbuddy inside the project, or pass `--repo-dir <path to the repo>`. |
+| `git doesn't know the revision "..."` | Check the branch, tag or commit you passed to `--branch` or `--since` (`git branch -a`, `git log --oneline`). For `HEAD`, the repo needs at least one commit. |
+| `--since "..." is not a revision: it can't start with "-"` | A revision is never an option. Check what you passed to `--branch` or `--since`. |
+| `Nothing to review: no staged changes` (or similar) | Nothing matched that flag. Stage changes with `git add`, use `--uncommitted`, or commit first for `--branch` and `--since`. New untracked files need `git add` or `git add -N`. |
+| `No diff on stdin` | `-` reads a piped diff, but nothing was piped in. Use `git diff \| reviewbuddy -`, or a git flag. |
+| `Unknown format "..."` | Use `text`, `json` or `sarif` in `--format`, `REVIEWBUDDY_FORMAT` or `"format"` in `.reviewbuddy.json`. |
+| Non-ASCII text shows up as `?` | Windows PowerShell 5.1 re-encodes text piped into node. Use a git flag or a diff file instead of a pipe. |
+| Code Scanning upload fails on a private repo | Code Scanning on private repositories requires GitHub Advanced Security. The job also needs `permissions: security-events: write`. |
 | `Invalid JSON in .reviewbuddy.json ...` | Fix the syntax. The file is plain JSON: no comments, no trailing commas, keys in double quotes. |
 | `"failOn" in .reviewbuddy.json must be ...` (or another key) | The key has the wrong type. See the [key reference](#reviewbuddyjson). |
 | `.reviewbuddy.json must not contain secrets` | Remove the key and set it as an environment variable or an Actions secret instead. If the key was ever committed, rotate it. |

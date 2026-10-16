@@ -1,4 +1,20 @@
 /**
+ * A diff file's or stdin's bytes as text. A UTF-8 byte order mark is dropped, and UTF-16 (LE or BE,
+ * told apart by its byte order mark) is decoded: Windows PowerShell 5.1's `git diff > file` writes UTF-16 LE.
+ * Anything else is read as UTF-8.
+ */
+export function decodeDiff(bytes) {
+  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return bytes.subarray(3).toString('utf8');
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return bytes.subarray(2).toString('utf16le');
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+    // Node has no UTF-16 BE decoder: swap each pair of bytes (a copy, dropping an odd last byte) and read it as LE.
+    const body = Buffer.from(bytes.subarray(2, 2 + ((bytes.length - 2) & ~1)));
+    return body.swap16().toString('utf16le');
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+
+/**
  * Split a unified diff that may touch several files into one diff per file,
  * so each file can be reviewed separately and comments can name their file.
  * Returns [{ filename, diff }]. Files with no added lines (deletions, pure

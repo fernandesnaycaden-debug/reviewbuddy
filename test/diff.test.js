@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
-import { addedLines, chunkDiff, commentableLines, numberDiffLines, splitDiff } from '../src/diff.js';
+import {
+  addedLines, chunkDiff, commentableLines, decodeDiff, numberDiffLines, splitDiff,
+} from '../src/diff.js';
 
 const gitDiff = [
   'diff --git a/src/a.js b/src/a.js',
@@ -71,4 +73,38 @@ test('the sample diff has its planted bugs on added lines', async () => {
   const [file] = splitDiff(await readFile(new URL('../samples/buggy.diff', import.meta.url), 'utf8'));
   const added = addedLines(file.diff);
   for (const line of [4, 15, 22]) assert.ok(added.has(line), `line ${line} should be added`);
+});
+
+// Encodings
+
+const BOM = String.fromCharCode(0xfeff);
+const text = "diff --git a/café.js b/café.js\n+const s = 'naïve ✓';\n";
+
+test('decodeDiff reads plain UTF-8 as is', () => {
+  assert.equal(decodeDiff(Buffer.from(text, 'utf8')), text);
+});
+
+test('decodeDiff drops a UTF-8 byte order mark', () => {
+  assert.equal(decodeDiff(Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(text, 'utf8')])), text);
+});
+
+test('decodeDiff decodes UTF-16 LE, as Windows PowerShell 5.1 writes with >', () => {
+  const bytes = Buffer.from(BOM + text, 'utf16le');
+  assert.deepEqual([...bytes.subarray(0, 2)], [0xff, 0xfe]);
+  assert.equal(decodeDiff(bytes), text);
+  assert.deepEqual(splitDiff(decodeDiff(bytes)).map((f) => f.filename), ['café.js']);
+});
+
+test('decodeDiff decodes UTF-16 BE, and leaves its input unchanged', () => {
+  const bytes = Buffer.from(BOM + text, 'utf16le').swap16();
+  const copy = Buffer.from(bytes);
+  assert.deepEqual([...bytes.subarray(0, 2)], [0xfe, 0xff]);
+  assert.equal(decodeDiff(bytes), text);
+  assert.deepEqual(bytes, copy);
+});
+
+test('decodeDiff handles empty input and a lone byte order mark', () => {
+  assert.equal(decodeDiff(Buffer.alloc(0)), '');
+  assert.equal(decodeDiff(Buffer.from([0xff, 0xfe])), '');
+  assert.equal(decodeDiff(Buffer.from([0xfe, 0xff, 0x00])), '');
 });

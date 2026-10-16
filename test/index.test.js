@@ -1,13 +1,17 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import {
   mkdir, mkdtemp, readFile, rm, writeFile,
 } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
+import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, mock, test } from 'node:test';
 import { markerFor } from '../src/dedupe.js';
 import {
-  buildReview, formatReport, main, parseFailOn, parseMinSeverity, writeReport,
+  buildReview, formatReport, main, parseFailOn, parseMinSeverity, readStdin, selectInput, writeReport,
 } from '../src/index.js';
 import { SYSTEM_PROMPT } from '../src/review.js';
 
@@ -156,6 +160,7 @@ function withEnv(vars, fn) {
     REVIEWBUDDY_MIN_SEVERITY: '',
     REVIEWBUDDY_IGNORE: '',
     REVIEWBUDDY_TIMEOUT: '',
+    REVIEWBUDDY_FORMAT: '',
     OLLAMA_MODEL: '',
     GITHUB_ACTIONS: '',
     GITHUB_STEP_SUMMARY: '',
@@ -803,3 +808,158 @@ test('main refuses a local config holding a secret before reviewing anything', (
   await assert.rejects(main([diffPath, '--repo-dir', join(dir, 'repo')]), /\.reviewbuddy\.json must not contain secrets, but it has "GROQ_API_KEY"/);
   assert.equal(fetch.mock.callCount(), 0);
 }));
+
+// Inputs: stdin, encodings, git flags
+
+test('selectInput picks git modes, stdin, a PR, a file, or the sample diff', () => {
+  assert.deepEqual(selectInput({ staged: true }, []), { kind: 'git', mode: 'staged' });
+  assert.deepEqual(selectInput({ uncommitted: true }, []), { kind: 'git', mode: 'uncommitted' });
+  assert.deepEqual(selectInput({ branch: 'main' }, []), { kind: 'git', mode: 'branch', rev: 'main' });
+  assert.deepEqual(selectInput({ since: 'HEAD~2' }, []), { kind: 'git', mode: 'since', rev: 'HEAD~2' });
+  assert.deepEqual(selectInput({}, ['-']), { kind: 'stdin' });
+  assert.deepEqual(selectInput({}, ['changes.diff']), { kind: 'file', path: 'changes.diff' });
+  assert.equal(selectInput({}, [PR_URL]).kind, 'pr');
+  assert.match(selectInput({}, []).path, /samples[\\/]buggy\.diff$/);
+  assert.throws(() => selectInput({ staged: true, since: 'v1' }, []), /Review one thing at a time/);
+  assert.throws(() => selectInput({ uncommitted: true }, ['-']), /Review one thing at a time/);
+});
+
+test('readStdin reads and decodes a piped diff', async () => {
+  assert.equal(await readStdin(Readable.from([Buffer.from(diff.slice(0, 20)), Buffer.from(diff.slice(20))])), diff);
+  const utf16 = Buffer.from(String.fromCharCode(0xfeff) + diff, 'utf16le');
+  assert.equal(await readStdin(Readable.from([utf16.subarray(0, 7), utf16.subarray(7)])), diff);
+});
+
+test('readStdin refuses a terminal, where nothing was piped in', async () => {
+  const stream = Object.assign(Readable.from([]), { isTTY: true });
+  await assert.rejects(readStdin(stream), /No diff on stdin\. Pipe one in/);
+});
+
+test('main reviews a UTF-16 diff file, as PowerShell 5.1\'s > writes it', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  const prompts = fakeOllama([]);
+  await writeFile(join(dir, 'changes.diff'), Buffer.from(String.fromCharCode(0xfeff) + diff, 'utf16le'));
+
+  await main([join(dir, 'changes.diff')]);
+
+  assert.equal(prompts.length, 1);
+  assert.match(prompts[0], /^File: src\/a\.js$/m);
+  assert.match(prompts[0], /\+const key = 'secret';/);
+}));
+
+// Output formats
+
+test('main --format json --output writes the JSON document', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  fakeOllama([{ line: 2, severity: 'bug', message: 'Unused key', suggestion: '' }]);
+  await writeFile(join(dir, 'changes.diff'), diff);
+  // --format wins over the .md extension.
+  const out = join(dir, 'out.md');
+
+  await main([join(dir, 'changes.diff'), '--format', 'json', '-o', out]);
+
+  const doc = JSON.parse(await readFile(out, 'utf8'));
+  assert.equal(doc.schemaVersion, 1);
+  assert.deepEqual(doc.files, [{ path: 'src/a.js', findings: [{ line: 2, severity: 'bug', message: 'Unused key' }] }]);
+  assert.match(logged(), /JSON written to /);
+}));
+
+test('main picks the format from --output\'s extension without --format', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  fakeOllama([{ line: 2, severity: 'bug', message: 'Unused key', suggestion: '' }]);
+  await writeFile(join(dir, 'changes.diff'), diff);
+
+  await main([join(dir, 'changes.diff'), '-o', join(dir, 'r.sarif')]);
+  const sarif = JSON.parse(await readFile(join(dir, 'r.sarif'), 'utf8'));
+  assert.equal(sarif.version, '2.1.0');
+  assert.equal(sarif.runs[0].results[0].ruleId, 'reviewbuddy/bug');
+
+  await main([join(dir, 'changes.diff'), '-o', join(dir, 'r.json')]);
+  assert.equal(JSON.parse(await readFile(join(dir, 'r.json'), 'utf8')).schemaVersion, 1);
+
+  await main([join(dir, 'changes.diff'), '-o', join(dir, 'r.md')]);
+  assert.match(await readFile(join(dir, 'r.md'), 'utf8'), /^# 🔍 ReviewBuddy Report/);
+}));
+
+test('REVIEWBUDDY_FORMAT works like --format', () => withEnv({ OLLAMA_URL: 'http://ollama.test', REVIEWBUDDY_FORMAT: 'sarif' }, async () => {
+  fakeOllama([]);
+  await writeFile(join(dir, 'changes.diff'), diff);
+
+  await main([join(dir, 'changes.diff'), '-o', join(dir, 'out.json')]);
+
+  assert.equal(JSON.parse(await readFile(join(dir, 'out.json'), 'utf8')).version, '2.1.0');
+}));
+
+test('--min-severity and --fail-on apply the same way with --format sarif', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  fakeOllama(mixed);
+  await writeFile(join(dir, 'changes.diff'), diff);
+  const out = join(dir, 'out.sarif');
+
+  await main([join(dir, 'changes.diff'), '--format', 'sarif', '-o', out, '--min-severity', 'bug', '--fail-on', 'bug']);
+
+  const { results: found } = JSON.parse(await readFile(out, 'utf8')).runs[0];
+  assert.deepEqual(found.map((r) => r.ruleId), ['reviewbuddy/security', 'reviewbuddy/bug']);
+  assert.equal(process.exitCode, 1);
+}));
+
+test('main writes an empty document when nothing is left to review', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  const fetch = mock.method(globalThis, 'fetch', async () => assert.fail('nothing should be fetched'));
+  await writeFile(join(dir, 'changes.diff'), diff.replaceAll('src/a.js', 'package-lock.json'));
+
+  await main([join(dir, 'changes.diff'), '-o', join(dir, 'out.json')]);
+
+  assert.equal(fetch.mock.callCount(), 0);
+  assert.deepEqual(JSON.parse(await readFile(join(dir, 'out.json'), 'utf8')).files, []);
+}));
+
+const BIN = fileURLToPath(new URL('../bin/reviewbuddy.js', import.meta.url));
+
+/** A stand-in for Ollama on 127.0.0.1 that answers every chat with findings. Returns { url, close }. */
+async function ollamaServer(findings) {
+  const server = createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      const content = JSON.stringify({ comments: findings });
+      res.end(`${JSON.stringify({ message: { content }, done: true })}\n`);
+    });
+  });
+  await new Promise((done) => { server.listen(0, '127.0.0.1', done); });
+  return { url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((done) => { server.close(done); }) };
+}
+
+/** Run the real CLI in a child process with stdin as input. Returns { code, stdout, stderr }. */
+function runCli(args, { stdin, env }) {
+  return new Promise((done, fail) => {
+    const child = spawn(process.execPath, [BIN, ...args], { cwd: dir, env: { ...process.env, ...env } });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('error', fail);
+    child.on('close', (code) => done({ code, stdout, stderr }));
+    child.stdin.end(stdin);
+  });
+}
+
+for (const format of ['json', 'sarif']) {
+  test(`with --format ${format} and no --output, stdout holds only the document; progress goes to stderr`, async () => {
+    const ollama = await ollamaServer([{
+      line: 2, severity: 'security', message: 'Hardcoded key', suggestion: '',
+    }]);
+    try {
+      const { code, stdout, stderr } = await runCli(['-', '--format', format, '--no-config', '--fail-on', 'security'], {
+        stdin: diff,
+        env: {
+          OLLAMA_URL: ollama.url, OLLAMA_MODEL: '', REVIEWBUDDY_PROVIDER: '', REVIEWBUDDY_FORMAT: '', REVIEWBUDDY_FAIL_ON: '', REVIEWBUDDY_MIN_SEVERITY: '', GITHUB_ACTIONS: '',
+        },
+      });
+      const doc = JSON.parse(stdout);
+      if (format === 'json') assert.equal(doc.files[0].findings[0].message, 'Hardcoded key');
+      else assert.equal(doc.runs[0].results[0].message.text, 'Hardcoded key');
+      assert.match(stderr, /Using ollama/);
+      assert.match(stderr, /Reviewing src\/a\.js \(1\/1\)/);
+      assert.match(stderr, /Failing: 1 finding match --fail-on security/);
+      // --fail-on still sets the exit code.
+      assert.equal(code, 1);
+    } finally {
+      await ollama.close();
+    }
+  });
+}

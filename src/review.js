@@ -1,5 +1,6 @@
 import { buildContext, matchesDiff } from './context.js';
 import { addedLines, chunkDiff, newLineTexts, numberDiffLines } from './diff.js';
+import { info } from './log.js';
 import { chat, promptChars } from './providers/index.js';
 
 export const SEVERITIES = ['bug', 'security', 'performance', 'suggestion'];
@@ -114,7 +115,7 @@ export async function reviewDiff(filename, diff, { timeoutMs, source = null, rul
   const chunks = chunkDiff(diff, Math.min(MAX_CHUNK_CHARS, promptChars() - extra));
   const comments = [];
   for (const [i, chunk] of chunks.entries()) {
-    if (chunks.length > 1) console.log(`  part ${i + 1}/${chunks.length} ...`);
+    if (chunks.length > 1) info(`  part ${i + 1}/${chunks.length} ...`);
     comments.push(...await reviewChunk(filename, chunk, { source, timeoutMs, system, extra }));
   }
 
@@ -135,8 +136,8 @@ async function reviewChunk(filename, diff, { source, timeoutMs, system, extra })
   const head = `File: ${filename}\n\n`;
   const body = `=== DIFF TO REVIEW ===\n${numberDiffLines(diff)}`;
   const context = buildContext(source, diff, promptChars() - head.length - body.length - CONTEXT_FRAME_CHARS - extra);
-  if (context) console.log(`  with ${context.kind === 'full' ? 'the full file' : 'the code around the changes'} as context`);
-  else if (source != null) console.log('  file too large for the context budget, reviewing the diff alone');
+  if (context) info(`  with ${context.kind === 'full' ? 'the full file' : 'the code around the changes'} as context`);
+  else if (source != null) info('  file too large for the context budget, reviewing the diff alone');
   const userPrompt = head + contextSection(context) + body;
 
   for (let attempt = 1; attempt <= 2; attempt++) {

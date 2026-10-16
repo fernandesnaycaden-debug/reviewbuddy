@@ -38,6 +38,14 @@ inputs:
   config:
     description: Read .reviewbuddy.json and .reviewbuddy.md from the PR's base branch. 'false' ignores both, like --no-config.
     default: 'true'
+  sarif-file:
+    description: Also write the findings as SARIF 2.1.0 to this path, for github/codeql-action/upload-sarif. Implies full, so every upload has every finding in the PR. Empty writes none.
+    default: ''
+
+outputs:
+  sarif-file:
+    description: The SARIF file's path, set when sarif-file was given and the file was written (also when fail-on fails the step). Empty otherwise.
+    value: ${{ steps.review.outputs.sarif-file }}
 
 runs:
   using: composite
@@ -47,6 +55,7 @@ runs:
         node-version: 22
 
     - name: Review pull request
+      id: review
       shell: bash
       # Inputs reach the script only as environment variables, never interpolated into it,
       # so a crafted value can't inject shell commands.
@@ -62,6 +71,7 @@ runs:
         INPUT_FULL: ${{ inputs.full }}
         INPUT_TIMEOUT: ${{ inputs.timeout }}
         INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_SARIF_FILE: ${{ inputs.sarif-file }}
       run: |
         if [ "$GITHUB_EVENT_NAME" != "pull_request" ] || [ -z "$PR_URL" ]; then
           echo "::error::reviewbuddy runs on pull_request events (this run is \"$GITHUB_EVENT_NAME\"). Trigger the workflow with on: pull_request."
@@ -90,5 +100,14 @@ runs:
         args=()
         if [ "$INPUT_FULL" = "true" ]; then args+=(--full); fi
         if [ "$INPUT_CONFIG" = "false" ]; then args+=(--no-config); fi
+        # Code scanning closes alerts missing from the latest upload, so a SARIF file must cover the
+        # whole PR, not only the commits since the last review.
+        if [ -n "$INPUT_SARIF_FILE" ]; then args+=(--full --format sarif --output "$INPUT_SARIF_FILE"); fi
 
-        node "$GITHUB_ACTION_PATH/bin/reviewbuddy.js" "$PR_URL" "${args[@]}"
+        # fail-on exits with 1; the output is still set so a later step can upload the findings.
+        status=0
+        node "$GITHUB_ACTION_PATH/bin/reviewbuddy.js" "$PR_URL" "${args[@]}" || status=$?
+        if [ -n "$INPUT_SARIF_FILE" ] && [ -f "$INPUT_SARIF_FILE" ]; then
+          echo "sarif-file=$INPUT_SARIF_FILE" >> "$GITHUB_OUTPUT"
+        fi
+        exit "$status"
