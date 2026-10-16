@@ -35,6 +35,15 @@ inputs:
   timeout:
     description: Seconds a single model request may take (0 = no limit). Empty uses .reviewbuddy.json, else the default.
     default: ''
+  concurrency:
+    description: How many files to review at once (1-16), like --concurrency. Empty uses .reviewbuddy.json, else the provider's default (2 for groq and openrouter, 4 for gemini and anthropic).
+    default: ''
+  max-files:
+    description: Review at most this many files, like --max-files; source files and the biggest changes go first, and the rest are listed in the review. Empty uses .reviewbuddy.json, else no limit.
+    default: ''
+  max-chunks-per-file:
+    description: Review at most this many pieces of one file (0 = no limit), like --max-chunks-per-file. Empty uses .reviewbuddy.json, else 10.
+    default: ''
   config:
     description: Read .reviewbuddy.json and .reviewbuddy.md from the PR's base branch. 'false' ignores both, like --no-config.
     default: 'true'
@@ -70,6 +79,9 @@ runs:
         INPUT_IGNORE: ${{ inputs.ignore }}
         INPUT_FULL: ${{ inputs.full }}
         INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_CONCURRENCY: ${{ inputs.concurrency }}
+        INPUT_MAX_FILES: ${{ inputs.max-files }}
+        INPUT_MAX_CHUNKS_PER_FILE: ${{ inputs.max-chunks-per-file }}
         INPUT_CONFIG: ${{ inputs.config }}
         INPUT_SARIF_FILE: ${{ inputs.sarif-file }}
       run: |
@@ -84,6 +96,9 @@ runs:
         export REVIEWBUDDY_MIN_SEVERITY="$INPUT_MIN_SEVERITY"
         export REVIEWBUDDY_IGNORE="$INPUT_IGNORE"
         export REVIEWBUDDY_TIMEOUT="$INPUT_TIMEOUT"
+        export REVIEWBUDDY_CONCURRENCY="$INPUT_CONCURRENCY"
+        export REVIEWBUDDY_MAX_FILES="$INPUT_MAX_FILES"
+        export REVIEWBUDDY_MAX_CHUNKS_PER_FILE="$INPUT_MAX_CHUNKS_PER_FILE"
 
         # Each provider reads its own key and model variables.
         case "$(echo "$INPUT_PROVIDER" | tr '[:upper:]' '[:lower:]')" in

@@ -42,16 +42,27 @@ function jsonFinding(c) {
   };
 }
 
-/** Review results ([{ filename, comments }]) as reviewbuddy's JSON document (see README, "JSON"). */
-export function formatJson(results, { provider, model, seconds }) {
+/**
+ * Review results ([{ filename, comments }]) as reviewbuddy's JSON document (see README, "JSON").
+ * notReviewed: [{ filename, reason, failed? }] for files left out or only partly reviewed; filename is null
+ * for a note about files GitHub didn't list at all.
+ */
+export function formatJson(results, {
+  provider, model, seconds, notReviewed = [],
+}) {
   return {
     schemaVersion: JSON_SCHEMA_VERSION,
     tool: { name: TOOL.name, version: TOOL.version },
     provider: provider ?? null,
     model: model ?? null,
     durationSeconds: Number(seconds),
-    summary: { files: results.length, findings: results.reduce((n, r) => n + r.comments.length, 0) },
+    summary: {
+      files: results.length,
+      findings: results.reduce((n, r) => n + r.comments.length, 0),
+      notReviewed: notReviewed.length,
+    },
     files: results.map((r) => ({ path: r.filename, findings: r.comments.map(jsonFinding) })),
+    notReviewed: notReviewed.map((n) => ({ path: n.filename ?? null, reason: n.reason })),
   };
 }
 
@@ -84,8 +95,23 @@ export function sarifUri(path) {
   return path.replace(/\\/g, '/').replace(/^(\.\/)+/, '');
 }
 
-/** Review results as a SARIF 2.1.0 log with one run. */
-export function formatSarif(results, { provider, model }) {
+/**
+ * A SARIF invocation listing what wasn't reviewed as notifications. executionSuccessful is false
+ * when a file failed, so a SARIF viewer shows the run was incomplete.
+ */
+function sarifInvocation(notReviewed) {
+  return {
+    executionSuccessful: !notReviewed.some((n) => n.failed),
+    toolExecutionNotifications: notReviewed.map((n) => ({
+      level: n.failed ? 'error' : 'warning',
+      message: { text: n.filename ? `${n.filename} not reviewed: ${n.reason}` : n.reason },
+      ...(n.filename && { locations: [{ physicalLocation: { artifactLocation: { uri: sarifUri(n.filename) } } }] }),
+    })),
+  };
+}
+
+/** Review results as a SARIF 2.1.0 log with one run. notReviewed: as for formatJson. */
+export function formatSarif(results, { provider, model, notReviewed = [] }) {
   const rules = sarifRules();
   const index = new Map(rules.map((r, i) => [r.name, i]));
   return {
@@ -93,6 +119,7 @@ export function formatSarif(results, { provider, model }) {
     version: '2.1.0',
     runs: [{
       tool: { driver: { ...TOOL, rules } },
+      invocations: [sarifInvocation(notReviewed)],
       results: results.flatMap(({ filename, comments }) => comments.map((c) => ({
         ruleId: `reviewbuddy/${c.severity}`,
         ruleIndex: index.get(c.severity),

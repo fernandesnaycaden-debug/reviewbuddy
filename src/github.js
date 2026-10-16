@@ -1,4 +1,6 @@
 // GitHub REST API client: fetches a pull request's diff, changed files and earlier reviews, and posts a review on it.
+// Limits (docs.github.com): the files API lists at most 3000 files, and compare lists at most 300.
+// The diff format is refused (HTTP 406) for diffs over 300 files or too many lines; callers fall back to those lists.
 
 import { fetchWithRetry } from './http.js';
 
@@ -21,12 +23,27 @@ export async function getPullRequest(pr, token) {
   return response.json();
 }
 
-/** Fetch the pull request as one unified diff covering all changed files. */
+/**
+ * Fetch the pull request as one unified diff covering all changed files.
+ * Throws an error with status 406 when the diff is too large for GitHub's diff format (see listPullRequestFiles).
+ */
 export async function getPullRequestDiff(pr, token) {
   const response = await request(pr, token, `pulls/${pr.number}`, {
     headers: { Accept: 'application/vnd.github.diff' },
   });
   return response.text();
+}
+
+export const MAX_PR_FILES = 3000;
+export const MAX_COMPARE_FILES = 300;
+
+/**
+ * List the pull request's changed files ({ filename, previous_filename?, status, additions, patch? }),
+ * 100 per page. Works for PRs too large for the diff format, up to GitHub's MAX_PR_FILES.
+ * A file's patch is missing when it is binary or its diff is too large.
+ */
+export function listPullRequestFiles(pr, token) {
+  return listAll(pr, token, `pulls/${pr.number}/files`, MAX_PR_FILES);
 }
 
 /**
@@ -39,6 +56,21 @@ export async function getCompareDiff(pr, token, base, head) {
       headers: { Accept: 'application/vnd.github.diff' },
     });
     return await response.text();
+  } catch (err) {
+    if (err.status === 404) return null;
+    throw err;
+  }
+}
+
+/**
+ * Fetch the files changed from commit base to head, in the shape listPullRequestFiles gives, or null if
+ * GitHub doesn't know base any more. GitHub lists at most MAX_COMPARE_FILES, all on the first page
+ * (page and per_page only page through the commits, so one commit per page keeps the reply small).
+ */
+export async function getCompareFiles(pr, token, base, head) {
+  try {
+    const response = await request(pr, token, `compare/${base}...${head}?per_page=1`);
+    return (await response.json()).files ?? [];
   } catch (err) {
     if (err.status === 404) return null;
     throw err;
@@ -98,14 +130,14 @@ export async function postReview(pr, token, { commitId, body, comments }) {
 
 const PER_PAGE = 100;
 
-/** GET a list endpoint page by page until a page comes back short. */
-async function listAll(pr, token, path) {
+/** GET a list endpoint page by page until a page comes back short, or max items are in. */
+async function listAll(pr, token, path, max = Infinity) {
   const items = [];
   for (let page = 1; ; page++) {
     const response = await request(pr, token, `${path}?per_page=${PER_PAGE}&page=${page}`);
     const batch = await response.json();
     items.push(...batch);
-    if (batch.length < PER_PAGE) return items;
+    if (batch.length < PER_PAGE || items.length >= max) return items;
   }
 }
 
@@ -142,7 +174,7 @@ async function request(pr, token, path, options = {}, retry = {}) {
     404: token
       ? `${name} not found, or the token has no access to ${pr.owner}/${pr.repo}.`
       : `${name} not found. If the repo is private, set GITHUB_TOKEN.`,
-    406: 'The diff is too large for the GitHub API.',
+    406: "The diff is too large for GitHub's diff format.",
   };
   const hint = hints[response.status] ? ` (${hints[response.status]})` : '';
   throw Object.assign(new Error(`GitHub returned HTTP ${response.status}${hint}: ${message}`), { status: response.status });

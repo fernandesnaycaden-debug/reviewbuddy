@@ -1,5 +1,6 @@
 // Anthropic provider: Claude through the Messages API.
 
+import { warn } from '../log.js';
 import { DEFAULT_TIMEOUT_MS, postJson, requireKey, withSchemaFallback } from './cloud.js';
 
 const API_URL = 'https://api.anthropic.com/v1/messages';
@@ -7,6 +8,7 @@ const LABEL = 'Anthropic';
 export const DEFAULT_MODEL = 'claude-opus-5-5';
 // Most user-prompt characters (diff plus file context) to send, about 20k tokens. Paid per token.
 export const PROMPT_CHARS = 60_000;
+export { DEFAULT_CONCURRENCY } from './cloud.js';
 export const MODEL_VAR = 'ANTHROPIC_MODEL';
 
 const NO_COMMENTS = '{"comments":[]}';
@@ -50,7 +52,7 @@ export async function chat(systemPrompt, userPrompt, schema, { timeoutMs = DEFAU
   }));
 
   if (reply.stop_reason === 'refusal') {
-    console.warn(`  Claude declined to review this part (${reply.stop_details?.category ?? 'refusal'}), skipping it.`);
+    warn(`  Claude declined to review this part (${reply.stop_details?.category ?? 'refusal'}), skipping it.`);
     return NO_COMMENTS;
   }
   // Thinking blocks come first; the answer is in the text blocks.

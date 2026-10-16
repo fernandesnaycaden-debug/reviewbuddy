@@ -1,16 +1,19 @@
 // Shared client for APIs that speak OpenAI's chat completions format (Groq, OpenRouter).
 
+import { warn } from '../log.js';
 import {
-  DEFAULT_TIMEOUT_MS, InvalidReplyError, postJson, requireKey, withSchemaFallback,
+  DEFAULT_CONCURRENCY, DEFAULT_TIMEOUT_MS, InvalidReplyError, postJson, requireKey, withSchemaFallback,
 } from './cloud.js';
 
 /**
  * Build a provider for an OpenAI-compatible /chat/completions endpoint.
  * headers are sent with every request; schemaBody is merged into requests that carry a schema.
  * promptChars: most user-prompt characters (diff plus file context) to send.
+ * concurrency: how many files to review at once by default.
  */
 export function openAICompatible({
   label, url, keyVar, keyUrl, modelVar, defaultModel, promptChars, headers = {}, schemaBody = {}, hints,
+  concurrency = DEFAULT_CONCURRENCY,
 }) {
   const modelName = () => process.env[modelVar] || defaultModel;
   const checkConfig = () => requireKey(keyVar, label, keyUrl);
@@ -24,7 +27,7 @@ export function openAICompatible({
       return await send(systemPrompt, userPrompt, schema, options);
     } catch (err) {
       if (!(err instanceof InvalidReplyError)) throw err;
-      console.warn(`Warning: ${err.message}`);
+      warn(`Warning: ${err.message}`);
       return err.output;
     }
   }
@@ -53,5 +56,6 @@ export function openAICompatible({
 
   return {
     chat, modelName, checkConfig, DEFAULT_MODEL: defaultModel, PROMPT_CHARS: promptChars, MODEL_VAR: modelVar,
+    DEFAULT_CONCURRENCY: concurrency,
   };
 }

@@ -8,7 +8,7 @@ import * as anthropic from '../src/providers/anthropic.js';
 import * as gemini from '../src/providers/gemini.js';
 import * as groq from '../src/providers/groq.js';
 import {
-  chat, describe, promptChars, useProvider,
+  chat, defaultConcurrency, describe, promptChars, useProvider,
 } from '../src/providers/index.js';
 import * as openrouter from '../src/providers/openrouter.js';
 
@@ -68,6 +68,35 @@ test('every provider has a prompt budget, and Ollama\'s fits its 8192-token cont
     return [name, promptChars()];
   }));
   assert.deepEqual(budgets, { ollama: 16_000, groq: 24_000, openrouter: 40_000, gemini: 60_000, anthropic: 60_000 });
+});
+
+test('each provider reviews a sensible number of files at once by default: one for a local model', () => {
+  Object.assign(process.env, { GROQ_API_KEY: KEY, OPENROUTER_API_KEY: KEY, GEMINI_API_KEY: KEY, ANTHROPIC_API_KEY: KEY });
+  const defaults = Object.fromEntries(['ollama', 'groq', 'openrouter', 'gemini', 'anthropic'].map((name) => {
+    useProvider(name);
+    return [name, defaultConcurrency()];
+  }));
+  assert.deepEqual(defaults, { ollama: 1, groq: 2, openrouter: 2, gemini: 4, anthropic: 4 });
+  // By name too, without selecting it.
+  assert.equal(defaultConcurrency('Gemini'), 4);
+});
+
+test('errors that would fail every file are marked fatal; others are not', async () => {
+  process.env.GROQ_API_KEY = KEY;
+  useProvider('groq');
+  const fatal = async (status) => {
+    mock.method(globalThis, 'fetch', async () => Response.json({ error: { message: 'x' } }, { status, headers: { 'Retry-After': '0' } }));
+    const err = await chat('s', 'u', null).catch((e) => e);
+    mock.restoreAll();
+    mock.method(console, 'warn', () => {});
+    return err.fatal;
+  };
+  assert.equal(await fatal(401), true);
+  assert.equal(await fatal(403), true);
+  assert.equal(await fatal(404), true);
+  assert.equal(await fatal(402), true);
+  assert.equal(await fatal(429), false);
+  assert.equal(await fatal(500), false);
 });
 
 test('useProvider takes the name in any case, and the model it is given over the default', () => {

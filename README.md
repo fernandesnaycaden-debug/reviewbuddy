@@ -202,7 +202,7 @@ The Markdown report includes a summary table, the model name, and per-file findi
   "provider": "groq",
   "model": "openai/gpt-oss-20b",
   "durationSeconds": 14.2,
-  "summary": { "files": 1, "findings": 2 },
+  "summary": { "files": 1, "findings": 2, "notReviewed": 0 },
   "files": [
     {
       "path": "src/services/orders.js",
@@ -211,7 +211,8 @@ The Markdown report includes a summary table, the model name, and per-file findi
         { "line": 22, "severity": "bug", "message": "Off-by-one: `<=` reads past the end of the array." }
       ]
     }
-  ]
+  ],
+  "notReviewed": []
 }
 ```
 
@@ -219,6 +220,7 @@ The Markdown report includes a summary table, the model name, and per-file findi
 - `path` is relative to the repository root, as in the diff. `line` is the line in the new version of the file.
 - `severity` is `security`, `bug`, `performance` or `suggestion`. `suggestion` (a one-line replacement for that line) and `endLine` are only there when there is one.
 - `files` lists every reviewed file, including ones with no findings.
+- `notReviewed` lists files that were left out or only partly reviewed, as `{ "path": "...", "reason": "..." }`: too large for the GitHub API, over `--max-files`, failed, or partly reviewed (see [Large pull requests](#large-pull-requests)). `path` is `null` for a note about files GitHub didn't list at all.
 
 ### SARIF
 
@@ -230,7 +232,7 @@ The Markdown report includes a summary table, the model name, and per-file findi
 | `performance` | `warning` |
 | `suggestion` | `note` |
 
-A suggested fix is added to the result's message as `Suggested fix: ...`. To see the results on GitHub, see [Upload findings to Code Scanning](#upload-findings-to-code-scanning).
+A suggested fix is added to the result's message as `Suggested fix: ...`. Files that weren't reviewed are `toolExecutionNotifications` on the run's invocation (`error` for a failed file, `warning` otherwise), and `executionSuccessful` is `false` when a file failed. To see the results on GitHub, see [Upload findings to Code Scanning](#upload-findings-to-code-scanning).
 
 ## Fail on certain findings
 
@@ -282,6 +284,7 @@ How the review looks on GitHub:
 - Each finding is an inline comment like **[SECURITY]** Hardcoded API key; load it from an environment variable.
 - When the fix is a small, certain change to that one line, the comment ends with a GitHub suggestion. The author can apply it with **Commit suggestion**, or batch several into one commit from the **Files changed** tab.
 - The review summary says how many issues were found and which model found them. Findings that point at a line outside the diff can't be attached to that line, so they are listed in the summary instead (without a suggestion).
+- At most 50 findings are posted inline, the most severe first; any more are listed in the summary (see [Large pull requests](#large-pull-requests)). So are files that weren't reviewed.
 
 ### Suggested fixes
 
@@ -304,6 +307,7 @@ Each review ends with a hidden marker, `<!-- reviewbuddy:sha=... -->`, that reco
 - **No new commits since then:** it prints `Already reviewed abc1234, nothing new` and stops. No model is called.
 - **New commits:** it reviews only the changes since the reviewed commit (GitHub's compare diff), limited to files the PR itself changes. The review summary says `since abc1234`.
 - **The reviewed commit is gone** (after a force-push or rebase): it says so and reviews the whole PR.
+- **A file failed last time:** that review's marker names the commit the run started from (the earlier reviewed commit, or the PR's base commit for a first review) instead of the head. So the next run reviews those changes again, failed files included, and skips the findings that were already posted.
 - **A finding was already posted:** an inline comment from an earlier reviewbuddy review on the same file, line and severity is not posted again. The run prints how many it skipped.
 - **Nothing new to post:** no review is posted, not even an empty one. This includes a first run that finds no issues at all, so the next run reviews from the last commit that did get a review (or the whole PR, if none did).
 
@@ -315,7 +319,62 @@ npm run review -- https://github.com/owner/repo/pull/12 --full
 
 `--dry-run` prints all of this too: which commit it would diff from, whether it fell back to a full review, how many findings it skipped, and the review it would post.
 
-Known limits: matching is by line number, so a finding whose code moved is posted again on its new line. If the base branch was merged into the PR, the incremental diff includes those changes in files the PR also touches. Findings that went into an earlier review's summary (lines outside the diff) are not checked for duplicates.
+Known limits: matching is by line number, so a finding whose code moved is posted again on its new line. If the base branch was merged into the PR, the incremental diff includes those changes in files the PR also touches. Findings that went into an earlier review's summary (lines outside the diff, or over the inline limit) are not checked for duplicates.
+
+## Large pull requests
+
+reviewbuddy handles PRs with hundreds of files. It falls back to other GitHub APIs when the diff is too big, reviews several files at once, and has limits so a huge PR can't run for hours or run up a big bill.
+
+### When GitHub won't send the diff
+
+GitHub refuses to send a PR as one diff (HTTP 406) once it is too big: over 300 files, or too many lines. reviewbuddy then lists the PR's changed files page by page (100 per page) and builds the same per-file diffs from them. Nothing else changes: the same line numbers, comments and suggestions. You'll see:
+
+```
+The diff is too large for GitHub's diff format, reading the changed files page by page instead.
+```
+
+What GitHub's files API can't give you:
+
+- **Files without a patch.** GitHub leaves out the diff of a file when it alone is too large. Those files are skipped and listed in the review summary as `not reviewed: too large for the GitHub API`. Binary files have no patch either, but were never reviewed, so they aren't listed. Neither are ignored files such as lockfiles.
+- **More than 3,000 files.** The files API lists at most 3,000. If the PR changes more, the rest are not seen at all, and the summary says how many.
+
+Incremental reviews use GitHub's compare API, which has its own limits. If the compare diff is refused or times out, reviewbuddy reads the compare API's file list instead. That list has at most 300 files and can't be paged through, so when it is full, reviewbuddy says so and reviews the whole PR instead (`Too many changes since abc1234 for GitHub's compare API ..., reviewing the whole PR`).
+
+### Reviewing files in parallel
+
+`--concurrency N` reviews up to N files at once (1 to 16). The pieces of one large file are still reviewed one after another. Set it per run, with `REVIEWBUDDY_CONCURRENCY`, with `"concurrency"` in `.reviewbuddy.json`, or with the action's `concurrency` input. Without it, the default depends on the provider:
+
+| Provider | Default | Why |
+|----------|---------|-----|
+| Ollama | 1 | One local model on one machine gains nothing from parallel requests; they only queue and risk timeouts |
+| Groq, OpenRouter | 2 | Their free tiers limit tokens or requests per minute, and more requests at once just hit that limit sooner |
+| Gemini, Anthropic | 4 | Higher limits, so a few at a time cut the wall-clock time a lot |
+
+On a free tier, keep the default or go lower. On paid plans with high limits, 6 to 8 is usually safe; past that, rate limits tend to cancel out the gain. Ollama on a machine with lots of GPU memory and `OLLAMA_NUM_PARALLEL` set can go to 2 to 4.
+
+The output stays readable: each file's lines are held back and printed as one block when that file is done, headed by a running count:
+
+```
+Reviewing 140 files with concurrency 4
+
+Reviewed src/api/users.js (1/140)
+  src/api/users.js:42 [BUG] ...
+
+Reviewed src/db/query.js (2/140)
+  No issues found.
+```
+
+Blocks print in the order files finish. Everything else stays in the PR's file order, whatever order files finish in: the posted review, the job summary, the Markdown report, and the JSON and SARIF documents.
+
+**Rate limits.** When a provider or GitHub answers HTTP 429 (or GitHub's 403 secondary rate limit), reviewbuddy waits as long as its `Retry-After` header asks (up to 60 seconds). It also pauses **every** request to that host for that long, not just the one that got the 429, so parallel workers don't keep hammering an API that asked them to stop. The pause is printed right away: `Groq rate limited (HTTP 429), pausing requests to it for 12.0s (1/3)...`.
+
+**When a file fails.** If one file still fails after the retries (a timeout, a server error, a rate limit that doesn't clear), the other files carry on. The failed file is listed in the output and the review summary, and the run exits with code 1, so the check shows the review is incomplete. The next run tries it again (see [Running it again on the same PR](#running-it-again-on-the-same-pr)). Errors that would fail every file stop the run at once: a missing or rejected API key, a model that doesn't exist, an exhausted OpenRouter balance, or Ollama not running.
+
+### Limits
+
+- **`--max-files N`** reviews at most N files (`REVIEWBUDDY_MAX_FILES`, `"maxFiles"`, action input `max-files`). Default: no limit. Files are picked in this order: source code first, then tests (`test/`, `tests/`, `__tests__/`, `*.test.*`, `*.spec.*`, `*_test.*`), then docs and config (`docs/`, `*.md`, `*.txt`, `*.json`, `*.yml`, `*.toml`, ...). Within each group, files with the most added lines go first. The chosen files are reviewed and reported in the PR's order; the rest are listed in the summary as `over --max-files N`. For the action on a busy repo, `max-files: 100` is a sensible cap.
+- **`--max-chunks-per-file N`** reviews at most the first N pieces of any one file (`REVIEWBUDDY_MAX_CHUNKS_PER_FILE`, `"maxChunksPerFile"`, action input `max-chunks-per-file`). Default: **10**; `0` means no limit. A big file's diff is split into pieces that fit the model's prompt (16,000 characters each on Ollama, up to 60,000 on cloud providers). Ten pieces cover a few thousand changed lines, which is more than nearly any hand-written change. A file past that is almost always generated, vendored or a data dump, and could otherwise eat the whole run on its own. Such a file is listed in the summary as `partly reviewed: the first 10 of 37 parts`; its findings from the reviewed parts are kept.
+- **Inline comments.** GitHub documents no maximum number of comments per review, but a review with hundreds of them is slow to post, may be refused, and buries the important findings. So reviewbuddy posts at most **50** inline comments, the most severe first (`security`, then `bug`, `performance`, `suggestion`; ties in file order). It lists the rest in the review summary, with file and line. Everything still goes in one review, rather than several that would each notify the author and count against GitHub's limit on content created per minute. If the summary itself would pass GitHub's size limit for a review body (65,536 characters), it is cut at a line break with a note. The job summary, `--output`, JSON and SARIF always have every finding.
 
 ## Run it on every pull request
 
@@ -370,6 +429,9 @@ No checkout step is needed: the action downloads the PR's diff and the changed f
 | `ignore` | none | Extra comma-separated file patterns to skip, like `--ignore` |
 | `full` | `false` | `true` reviews the whole PR every time, like `--full` |
 | `timeout` | the provider's default | Seconds a single model request may take, like `--timeout` |
+| `concurrency` | the provider's default (2 for `groq` and `openrouter`, 4 for `gemini` and `anthropic`) | Files to review at once, 1 to 16, like `--concurrency`; see [Large pull requests](#large-pull-requests) |
+| `max-files` | none (no limit) | Review at most this many files, like `--max-files` |
+| `max-chunks-per-file` | `10` | Review at most this many pieces of one file (`0` = no limit), like `--max-chunks-per-file` |
 | `config` | `true` | `false` ignores the repo's `.reviewbuddy.json` and `.reviewbuddy.md`, like `--no-config` |
 | `sarif-file` | none | Also write the findings as SARIF to this path, for [Code Scanning](#upload-findings-to-code-scanning). Implies `full` |
 | `github-token` | `${{ github.token }}` | Token used to read the PR and post the review |
@@ -473,6 +535,9 @@ Both are optional, and a missing file is not an error. [examples/](examples/) ha
 | `failOn` | array of strings | `--fail-on`, `REVIEWBUDDY_FAIL_ON` | Severities that make the run exit with code 1 (fail the check) |
 | `timeout` | number | `--timeout`, `REVIEWBUDDY_TIMEOUT` | Seconds a single model request may take, `0` for no limit |
 | `format` | string | `--format`, `REVIEWBUDDY_FORMAT` | `text`, `json` or `sarif`; see [Output formats](#output-formats) |
+| `concurrency` | whole number, 1 to 16 | `--concurrency`, `REVIEWBUDDY_CONCURRENCY` | Files to review at once; see [Large pull requests](#large-pull-requests) |
+| `maxFiles` | whole number | `--max-files`, `REVIEWBUDDY_MAX_FILES` | Review at most this many files, `0` for no limit |
+| `maxChunksPerFile` | whole number | `--max-chunks-per-file`, `REVIEWBUDDY_MAX_CHUNKS_PER_FILE` | Review at most this many pieces of one file, `0` for no limit |
 
 The file must be plain JSON (no comments, no trailing commas). A syntax error or a wrong type stops the run with a message naming the file and the key. An unknown key only prints a warning, so a typo like `"failon"` shows up in the log.
 
@@ -541,6 +606,9 @@ These variables override the reviewed repo's [`.reviewbuddy.json`](#configure-pe
 | `REVIEWBUDDY_MIN_SEVERITY` | none (report everything) | Least serious severity to report (`security` > `bug` > `performance` > `suggestion`), like `--min-severity` |
 | `REVIEWBUDDY_TIMEOUT` | `600` (Ollama), `300` (cloud) | Seconds a single model request may take, like `--timeout`. `0` means no limit |
 | `REVIEWBUDDY_FORMAT` | `text` (or from `--output`'s extension) | `text`, `json` or `sarif`, like `--format` |
+| `REVIEWBUDDY_CONCURRENCY` | `1` (Ollama), `2` (Groq, OpenRouter), `4` (Gemini, Anthropic) | Files to review at once, 1 to 16, like `--concurrency` |
+| `REVIEWBUDDY_MAX_FILES` | none (no limit) | Review at most this many files, like `--max-files` |
+| `REVIEWBUDDY_MAX_CHUNKS_PER_FILE` | `10` | Review at most this many pieces of one file, like `--max-chunks-per-file`. `0` means no limit |
 
 Pass `--timeout <seconds>` to override `REVIEWBUDDY_TIMEOUT` for one run, for example `npm run review -- changes.diff --timeout 1200` for a slow model.
 
@@ -552,10 +620,13 @@ Pass `--timeout <seconds>` to override `REVIEWBUDDY_TIMEOUT` for one run, for ex
 | `-` (as the target) | Read the diff from stdin |
 | `--format text\|json\|sarif` | How to write the results; see [Output formats](#output-formats) |
 | `--output <file>`, `-o` | Write the results to a file instead of (JSON, SARIF) or as well as (text) the terminal |
+| `--concurrency <n>` | Review up to n files at once; see [Large pull requests](#large-pull-requests) |
+| `--max-files <n>` | Review at most n files, source files and the biggest changes first |
+| `--max-chunks-per-file <n>` | Review at most the first n pieces of any one file (`0` = no limit) |
 
 With the default Claude models (Opus 5.5, Sonnet 5.5, Opus 5, Fable 5.1), reviewbuddy turns on Anthropic's server-side refusal fallback. If a safety classifier declines to review a piece of code, another Claude model finishes the request. A piece that is still declined, or that Gemini blocks, is skipped with a warning.
 
-Network errors and HTTP 429/5xx responses from GitHub, Ollama and the cloud providers are retried up to 3 times with backoff (1s, 2s, 4s, or whatever `Retry-After` asks for). Posting the review is only retried after a 429, so a PR never gets the same review twice. GitHub requests time out after 30 seconds.
+Network errors and HTTP 429/5xx responses from GitHub, Ollama and the cloud providers are retried up to 3 times with backoff (1s, 2s, 4s, or whatever `Retry-After` asks for, up to 60s). A rate limit (429, or GitHub's 403 secondary rate limit) also pauses every other request to the same host for that long, so files reviewed in parallel wait together. Posting the review is only retried after a rate limit, so a PR never gets the same review twice. GitHub requests time out after 30 seconds.
 
 ## Tests
 
@@ -563,7 +634,7 @@ Network errors and HTTP 429/5xx responses from GitHub, Ollama and the cloud prov
 npm test
 ```
 
-The tests cover diff parsing, line numbering, chunking, the ignore list, reply parsing, full-file context (the full file, the windows around each hunk, the budget cutoff, files that don't match the diff, fetching files at the head commit, `--repo-dir` and paths outside it), `--min-severity` and how it interacts with `--fail-on`, suggested fixes (parsing, validation, indentation, the suggestion block in posted comments, the report's Fix line), each provider's prompt budget, retries and timeouts, the GitHub client (including pagination and compare diffs), review markers and skipping findings already posted, re-runs (same commit, new commits, force-push fallback, `--full`), splitting findings between inline comments and the review body, the Markdown report, `--fail-on` and exit codes, GitHub Actions annotations (and their escaping), the job summary, fork PRs without a key or with a read-only token, a full run with GitHub and Ollama mocked, per-repository config (validation, secret rejection, unknown keys, which value wins for each setting, ignore-pattern merging, finding the files up to the git root, reading them from the PR's base commit, `--no-config`, the rules cap and its effect on the context budget, and the prompt staying unchanged without rules), each cloud provider's requests, replies and errors (provider selection, missing keys, schema fallback, 401/404/429), the git flags (the git arguments for each mode, rejecting revisions that start with `-`, missing git, not a repository, unknown revisions, nothing to review, and, in temporary git repositories, that each mode reads its context from the index, the working tree or HEAD), reading stdin, UTF-8 byte order marks and UTF-16 diffs, choosing the format from `--format` or the extension, stdout holding only the document in JSON and SARIF modes (checked by running the CLI in a child process), the JSON document's shape, and the SARIF log's structure and level mapping (checked by hand against the essentials of the 2.1.0 schema). They need neither Ollama, API keys nor network access; the git tests are skipped if git isn't installed.
+The tests cover diff parsing, line numbering, chunking, the ignore list, reply parsing, full-file context (the full file, the windows around each hunk, the budget cutoff, files that don't match the diff, fetching files at the head commit, `--repo-dir` and paths outside it), `--min-severity` and how it interacts with `--fail-on`, suggested fixes (parsing, validation, indentation, the suggestion block in posted comments, the report's Fix line), each provider's prompt budget, retries and timeouts, the GitHub client (including pagination and compare diffs), large pull requests (the HTTP 406 fallback to the files API with pagination, files without a patch, the 3,000-file note, building per-file diffs from patches with the same line numbers as from a diff, the compare API fallback and its 300-file cap, the worker pool's limit, ordering and error isolation, output kept in file order while files finish out of order, a failing file not losing the others, errors that stop the run, `Retry-After` and the pause shared across requests to one host, each provider's default concurrency, `--max-files` ordering and the 50-comment inline cap), review markers and skipping findings already posted, re-runs (same commit, new commits, force-push fallback, `--full`), splitting findings between inline comments and the review body, the Markdown report, `--fail-on` and exit codes, GitHub Actions annotations (and their escaping), the job summary, fork PRs without a key or with a read-only token, a full run with GitHub and Ollama mocked, per-repository config (validation, secret rejection, unknown keys, which value wins for each setting, ignore-pattern merging, finding the files up to the git root, reading them from the PR's base commit, `--no-config`, the rules cap and its effect on the context budget, and the prompt staying unchanged without rules), each cloud provider's requests, replies and errors (provider selection, missing keys, schema fallback, 401/404/429), the git flags (the git arguments for each mode, rejecting revisions that start with `-`, missing git, not a repository, unknown revisions, nothing to review, and, in temporary git repositories, that each mode reads its context from the index, the working tree or HEAD), reading stdin, UTF-8 byte order marks and UTF-16 diffs, choosing the format from `--format` or the extension, stdout holding only the document in JSON and SARIF modes (checked by running the CLI in a child process), the JSON document's shape, and the SARIF log's structure and level mapping (checked by hand against the essentials of the 2.1.0 schema). They need neither Ollama, API keys nor network access; the git tests are skipped if git isn't installed.
 
 ## Expected output
 
@@ -577,7 +648,9 @@ The sample [samples/buggy.diff](samples/buggy.diff) contains three planted bugs:
 A good run looks roughly like this. The wording and timing depend on the model and the machine:
 
 ```
-Reviewing src/services/orders.js (1/1) ...
+Reviewing 1 file with concurrency 1
+
+Reviewed src/services/orders.js (1/1)
   src/services/orders.js:4 [SECURITY] Hardcoded API key; load it from an environment variable.
   src/services/orders.js:15 [SECURITY] SQL injection from string concatenation; use a parameterized query.
   src/services/orders.js:22 [BUG] Off-by-one; `<=` reads past the end of the array, so the total is NaN.
@@ -618,7 +691,7 @@ The first run can't see `getUser`, so models often flag line 41 as a possible nu
 | `Set GROQ_API_KEY to use Groq` (or another `*_API_KEY`) | The provider you picked needs a key. Set it with `$env:GROQ_API_KEY = "..."`, or pick another provider. |
 | `Groq returned HTTP 401 (Groq rejected the API key ...)` | The key is wrong, expired or revoked (also shown for HTTP 403). Create a new one. |
 | `... returned HTTP 404 (model "..." not found ...)` | The `*_MODEL` variable names a model that provider doesn't offer. Unset it to use the default, or check the provider's model list. |
-| `... returned HTTP 429 (rate limited ...)` | You hit the free tier's per-minute or daily limit. reviewbuddy already retried. Wait, review a smaller diff, or switch provider. |
+| `... returned HTTP 429 (rate limited ...)` | You hit the free tier's per-minute or daily limit. reviewbuddy already retried. Wait, lower `--concurrency`, review a smaller diff, or switch provider. |
 | `OpenRouter returned HTTP 402` | Your OpenRouter balance is used up. Add credits, or use a free model. |
 | `... didn't reply within 300s` | The cloud model is slow or overloaded. Raise `--timeout`, or pick a faster model. |
 | `Retrying without the JSON schema, in plain JSON mode` | Only a warning: the model doesn't support structured output, so reviewbuddy uses plain JSON mode for it. |
@@ -626,7 +699,15 @@ The first run can't see `getUser`, so models often flag line 41 as a possible nu
 | `GitHub returned HTTP 401` | The token is wrong or expired. Create a new one. |
 | `GitHub returned HTTP 403` | The token doesn't have Pull requests: Read and write on that repo. |
 | `GitHub returned HTTP 404` | Check the PR URL. For a private repo, the token must include that repo. |
-| `GitHub returned HTTP 406` | The PR is too large for GitHub's diff API. Check out its branch and review it locally with `--branch <base>` instead. |
+| `The diff is too large for GitHub's diff format, reading the changed files page by page instead` | Not an error: the PR is too big for GitHub's diff format, so reviewbuddy uses the files API instead. See [Large pull requests](#large-pull-requests). |
+| `not reviewed: too large for the GitHub API` | GitHub sent no diff for that one file because it is too large. Review it locally (`--branch <base>` in a checkout of the PR), or split the change. |
+| `GitHub's files API lists at most 3000 files` | The PR changes more than 3,000 files and GitHub won't list the rest. Split the PR, or review it locally with `--branch <base>`. |
+| `Too many changes since abc1234 for GitHub's compare API` | Not an error: more than 300 files changed since the last review, so reviewbuddy reviews the whole PR instead. Findings already posted are still skipped. |
+| `... rate limited (HTTP 429), pausing requests to it for ...` | Not an error: the API asked reviewbuddy to slow down, so every request to it waits. If it happens a lot, lower `--concurrency`. |
+| `Incomplete: 2 files could not be reviewed` | Those files failed after every retry (each one's error is printed above). The other files were reviewed and posted, but the run exits with code 1. Run it again; the next run retries them. For repeated rate limits, lower `--concurrency`; for timeouts, raise `--timeout`. |
+| `partly reviewed: the first 10 of 37 parts` | That file's diff is very large, so only its first pieces were reviewed. Raise `--max-chunks-per-file` (or set it to `0`), or add the file to `ignore` if it is generated. |
+| `over --max-files N` | Not an error: the PR has more files than `--max-files`. Raise it, or remove it for no limit. |
+| `Invalid value "..." in --concurrency` | Give a whole number from 1 to 16 (`--max-files` and `--max-chunks-per-file` take any whole number, `0` for no limit). |
 | `Already reviewed abc1234, nothing new` | Not an error: the PR's head commit already has a reviewbuddy review. Push new commits, or add `--full` to review it again. |
 | `Previous review's commit abc1234 no longer exists ... reviewing the whole PR` | The branch was force-pushed or rebased, so there's nothing to diff against. reviewbuddy reviews the whole PR instead; findings already posted are still skipped. |
 | `No new findings to post.` | Not an error: the new commits had no issues, or every finding was already posted. Nothing was posted. |

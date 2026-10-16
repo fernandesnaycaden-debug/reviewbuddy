@@ -3,7 +3,7 @@
 import { openAICompatible } from './openai-compatible.js';
 
 export const {
-  chat, modelName, checkConfig, DEFAULT_MODEL, PROMPT_CHARS, MODEL_VAR,
+  chat, modelName, checkConfig, DEFAULT_MODEL, PROMPT_CHARS, MODEL_VAR, DEFAULT_CONCURRENCY,
 } = openAICompatible({
   label: 'Groq',
   url: 'https://api.groq.com/openai/v1/chat/completions',
@@ -13,4 +13,6 @@ export const {
   defaultModel: 'openai/gpt-oss-20b',
   // Kept small: the free tier limits tokens per minute.
   promptChars: 24_000,
+  // The free tier's tokens-per-minute limit is reached by about two requests at once.
+  concurrency: 2,
 });

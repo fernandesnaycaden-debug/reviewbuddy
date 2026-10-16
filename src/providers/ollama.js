@@ -12,6 +12,8 @@ const NUM_CTX = 8192;
 // Most user-prompt characters (diff plus file context) to send. num_ctx is 8192 tokens at about
 // 3 characters each, and the system prompt and the reply need room too.
 export const PROMPT_CHARS = 16_000;
+// One model on one machine: parallel requests only queue up inside Ollama and risk timeouts.
+export const DEFAULT_CONCURRENCY = 1;
 
 export function modelName() {
   return process.env[MODEL_VAR] || DEFAULT_MODEL;
@@ -50,7 +52,8 @@ export async function chat(systemPrompt, userPrompt, schema, { timeoutMs = DEFAU
       const hint = response.status === 404
         ? ` (model "${model}" isn't installed: set OLLAMA_MODEL to one listed by "ollama list", or run "ollama pull ${model}")`
         : '';
-      throw new Error(`Ollama returned HTTP ${response.status}${hint}: ${details}`);
+      // A missing model fails every file the same way, so the run stops (see mapPool).
+      throw Object.assign(new Error(`Ollama returned HTTP ${response.status}${hint}: ${details}`), { fatal: response.status === 404 });
     }
     return await readStream(response);
   } catch (err) {
@@ -59,7 +62,7 @@ export async function chat(systemPrompt, userPrompt, schema, { timeoutMs = DEFAU
     }
     if (err.message.startsWith('Ollama')) throw err;
     if (err.cause?.code === 'ECONNREFUSED') {
-      throw new Error(`Could not connect to Ollama at ${baseUrl}. Is it running? Start it with "ollama serve".`);
+      throw Object.assign(new Error(`Could not connect to Ollama at ${baseUrl}. Is it running? Start it with "ollama serve".`), { fatal: true });
     }
     throw new Error(`Request to Ollama at ${baseUrl} failed: ${err.cause?.message || err.message}`);
   }

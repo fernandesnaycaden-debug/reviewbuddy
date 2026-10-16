@@ -2,8 +2,11 @@
 // to plain JSON mode when an API or model won't take a JSON schema.
 
 import { fetchWithRetry } from '../http.js';
+import { warn } from '../log.js';
 
 export const DEFAULT_TIMEOUT_MS = 300_000;
+// Files reviewed at once on a paid API. Free tiers get less (see groq.js, openrouter.js).
+export const DEFAULT_CONCURRENCY = 4;
 
 /** Return the API key in keyVar, or explain where to get one. The error has code MISSING_API_KEY. */
 export function requireKey(keyVar, label, keyUrl) {
@@ -63,11 +66,13 @@ export async function postJson(url, { label, headers, body, timeoutMs, model, ke
     throw new SchemaRejectedError(`${label} returned HTTP ${status}: ${message}`);
   }
 
+  // These fail every file the same way, so the run stops instead of trying the rest (see mapPool).
+  const fatal = badKey || status === 404 || status === 402;
   const hint = badKey ? `${label} rejected the API key in ${keyVar}`
     : status === 404 ? `model "${model}" not found: set ${modelVar} to a model ${label} offers`
     : status === 429 ? `rate limited: ${label}'s free tier has per-minute and daily limits. Wait a bit, or switch provider`
     : hints[status];
-  throw new Error(`${label} returned HTTP ${status}${hint ? ` (${hint})` : ''}: ${message}`);
+  throw Object.assign(new Error(`${label} returned HTTP ${status}${hint ? ` (${hint})` : ''}: ${message}`), { fatal });
 }
 
 /** The error text from an API's JSON error body, or the raw body if it isn't one. */
@@ -100,7 +105,7 @@ export async function withSchemaFallback({ label, model }, schema, send) {
   } catch (err) {
     if (!(err instanceof SchemaRejectedError)) throw err;
     schemaRejected.add(key);
-    console.warn(`Warning: ${err.message}\nRetrying without the JSON schema, in plain JSON mode...`);
+    warn(`Warning: ${err.message}\nRetrying without the JSON schema, in plain JSON mode...`);
     return send(null);
   }
 }

@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, mock, test } from 'node:test';
 import {
-  CONFIG_FILE, findLocalConfig, loadConfig, loadRemoteConfig, MAX_RULES_CHARS, parseConfig, parseRules, resolveSettings, RULES_FILE,
+  CONFIG_FILE, DEFAULT_MAX_CHUNKS_PER_FILE, findLocalConfig, loadConfig, loadRemoteConfig, MAX_CONCURRENCY, MAX_RULES_CHARS,
+  parseConfig, parseCount, parseRules, resolveSettings, RULES_FILE,
 } from '../src/config.js';
 import { DEFAULT_IGNORE } from '../src/ignore.js';
 
@@ -100,7 +101,7 @@ test('parseConfig refuses anything that looks like a secret, and says where secr
 
 test('parseConfig warns about unknown keys and still uses the rest', () => {
   assert.deepEqual(parseConfig('{"minSeverity": "bug", "severity": "bug"}'), { minSeverity: 'bug' });
-  assert.match(warned(), /Warning: unknown key "severity" in \.reviewbuddy\.json, ignoring it\. Known keys: provider, model, ignore, defaultIgnore, minSeverity, failOn, timeout, format\./);
+  assert.match(warned(), /Warning: unknown key "severity" in \.reviewbuddy\.json, ignoring it\. Known keys: provider, model, ignore, defaultIgnore, minSeverity, failOn, timeout, concurrency, maxFiles, maxChunksPerFile, format\./);
 });
 
 test('parseConfig reads "format" in any case and rejects unknown ones', () => {
@@ -150,6 +151,9 @@ test('resolveSettings uses the built-in defaults when nothing is set', () => {
     minSeverity: undefined,
     timeoutMs: undefined,
     format: undefined,
+    concurrency: undefined,
+    maxFiles: 0,
+    maxChunksPerFile: 10,
     defaultIgnore: true,
     ignorePatterns: DEFAULT_IGNORE,
   });
@@ -349,3 +353,39 @@ test('the example files in examples/ are valid', async () => {
   assert.match(rules, /logger\.error/);
   assert.equal(console.warn.mock.callCount(), 0);
 });
+
+// Concurrency and limits for large pull requests
+
+test('parseConfig reads concurrency, maxFiles and maxChunksPerFile as whole numbers', () => {
+  assert.deepEqual(parseConfig('{"concurrency": 3, "maxFiles": 100, "maxChunksPerFile": 0}'), { concurrency: 3, maxFiles: 100, maxChunksPerFile: 0 });
+  assert.throws(() => parseConfig('{"concurrency": 0}'), /"concurrency" in \.reviewbuddy\.json must be a whole number from 1 to 16\./);
+  assert.throws(() => parseConfig('{"concurrency": 17}'), /from 1 to 16/);
+  assert.throws(() => parseConfig('{"concurrency": "4"}'), /"concurrency" .* must be a whole number/);
+  assert.throws(() => parseConfig('{"maxFiles": 2.5}'), /"maxFiles" .* must be a whole number of at least 0\./);
+  assert.throws(() => parseConfig('{"maxChunksPerFile": -1}'), /"maxChunksPerFile" .* must be a whole number of at least 0\./);
+});
+
+test('parseCount accepts whole numbers in range and names the source otherwise', () => {
+  assert.equal(parseCount(' 4 ', '--concurrency', { min: 1, max: MAX_CONCURRENCY }), 4);
+  assert.equal(parseCount('0', '--max-files'), 0);
+  for (const bad of ['0', '17', '2.5', '-1', 'four', '']) {
+    assert.throws(() => parseCount(bad, '--concurrency', { min: 1, max: 16 }), /Invalid value ".*" in --concurrency: give a whole number from 1 to 16\./);
+  }
+});
+
+test('resolveSettings: concurrency and the limits come from a flag, then a variable, then the file, then the default', () => {
+  const file = { concurrency: 2, maxFiles: 50, maxChunksPerFile: 5 };
+  assert.deepEqual(pick(resolveSettings({})), { concurrency: undefined, maxFiles: 0, maxChunksPerFile: DEFAULT_MAX_CHUNKS_PER_FILE });
+  assert.deepEqual(pick(resolveSettings({ file })), file);
+  const env = { REVIEWBUDDY_CONCURRENCY: '3', REVIEWBUDDY_MAX_FILES: '60', REVIEWBUDDY_MAX_CHUNKS_PER_FILE: '0' };
+  assert.deepEqual(pick(resolveSettings({ env, file })), { concurrency: 3, maxFiles: 60, maxChunksPerFile: 0 });
+  const flags = { concurrency: '8', 'max-files': '70', 'max-chunks-per-file': '2' };
+  assert.deepEqual(pick(resolveSettings({ flags, env, file })), { concurrency: 8, maxFiles: 70, maxChunksPerFile: 2 });
+  // An empty action input counts as unset.
+  assert.equal(resolveSettings({ env: { REVIEWBUDDY_CONCURRENCY: '' }, file }).concurrency, 2);
+  assert.throws(() => resolveSettings({ env: { REVIEWBUDDY_CONCURRENCY: '99' } }), /in REVIEWBUDDY_CONCURRENCY: give a whole number from 1 to 16/);
+});
+
+function pick({ concurrency, maxFiles, maxChunksPerFile }) {
+  return { concurrency, maxFiles, maxChunksPerFile };
+}

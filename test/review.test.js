@@ -159,3 +159,39 @@ test('the rules come out of the context budget, so the full file shrinks to exce
   // Ollama's budget: what the rules added to the system prompt plus the user prompt stays within it.
   assert.ok(system.length - SYSTEM_PROMPT.length + user.length <= 16_000);
 });
+
+/** A diff with n hunks of about 10,000 characters each, so every hunk is its own piece on Ollama. */
+function hugeDiff(n) {
+  const hunks = Array.from({ length: n }, (_, h) => [
+    `@@ -${h * 1000 + 1},0 +${h * 1000 + 1},200 @@`,
+    ...Array.from({ length: 200 }, (_, i) => `+const v${h}_${i} = '${'y'.repeat(30)}';`),
+  ]).flat();
+  return ['diff --git a/gen.js b/gen.js', '--- a/gen.js', '+++ b/gen.js', ...hunks].join('\n');
+}
+
+test('reviewDiff reviews only the first maxChunks pieces of a huge file and says so', async () => {
+  const saved = process.env.OLLAMA_URL;
+  process.env.OLLAMA_URL = 'http://ollama.test';
+  mock.method(console, 'log', () => {});
+  mock.method(console, 'warn', () => {});
+  const fetch = mock.method(globalThis, 'fetch', async () => new Response(`${JSON.stringify({ message: { content: '{"comments":[]}' }, done: true })}\n`));
+  try {
+    useProvider('ollama');
+    let partial;
+    await reviewDiff('gen.js', hugeDiff(5), { maxChunks: 2, onPartial: (p) => { partial = p; } });
+    assert.equal(fetch.mock.callCount(), 2);
+    assert.deepEqual(partial, { reviewed: 2, total: 5 });
+    assert.match(console.warn.mock.calls[0].arguments[0], /gen\.js is 5 parts; reviewing only the first 2 \(--max-chunks-per-file\)/);
+
+    // 0 means no limit, and a file within the limit isn't reported.
+    partial = undefined;
+    await reviewDiff('gen.js', hugeDiff(3), { maxChunks: 0, onPartial: (p) => { partial = p; } });
+    await reviewDiff('gen.js', hugeDiff(3), { maxChunks: 3, onPartial: (p) => { partial = p; } });
+    assert.equal(fetch.mock.callCount(), 8);
+    assert.equal(partial, undefined);
+  } finally {
+    mock.restoreAll();
+    if (saved === undefined) delete process.env.OLLAMA_URL;
+    else process.env.OLLAMA_URL = saved;
+  }
+});

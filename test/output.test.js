@@ -50,7 +50,7 @@ test('formatJson has a stable, documented shape', () => {
     provider: 'groq',
     model: 'm',
     durationSeconds: 1.5,
-    summary: { files: 2, findings: 4 },
+    summary: { files: 2, findings: 4, notReviewed: 0 },
     files: [
       {
         path: 'src/a.js',
@@ -67,6 +67,7 @@ test('formatJson has a stable, documented shape', () => {
       },
       { path: 'src\\win\\b.js', findings: [] },
     ],
+    notReviewed: [],
   });
   // It survives a round trip as JSON.
   assert.deepEqual(JSON.parse(JSON.stringify(doc)), doc);
@@ -74,7 +75,8 @@ test('formatJson has a stable, documented shape', () => {
 
 test('formatJson with nothing reviewed is still a complete document', () => {
   const doc = formatJson([], { provider: 'ollama', model: 'm', seconds: '0.0' });
-  assert.deepEqual(doc.summary, { files: 0, findings: 0 });
+  assert.deepEqual(doc.summary, { files: 0, findings: 0, notReviewed: 0 });
+  assert.deepEqual(doc.notReviewed, []);
   assert.deepEqual(doc.files, []);
   assert.equal(doc.durationSeconds, 0);
 });

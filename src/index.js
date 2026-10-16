@@ -8,20 +8,27 @@ import {
 import {
   dropPosted, findingKey, latestMarkedReview, markerFor, openFindings, parseMarker, postedKeys,
 } from './dedupe.js';
-import { commentableLines, decodeDiff, splitDiff } from './diff.js';
+import {
+  commentableLines, decodeDiff, filesFromApi, splitDiff,
+} from './diff.js';
 import {
   checkRev, GIT_MODES, gitDiff, gitShow,
 } from './git.js';
 import {
-  getCompareDiff, getFileContent, getPullRequest, getPullRequestDiff, listReviewComments, listReviews, parsePrUrl, postReview,
+  getCompareDiff, getCompareFiles, getFileContent, getPullRequest, getPullRequestDiff, listPullRequestFiles,
+  listReviewComments, listReviews, MAX_COMPARE_FILES, MAX_PR_FILES, parsePrUrl, postReview,
 } from './github.js';
 import {
   findLocalConfig, loadConfig, loadRemoteConfig, resolveSettings,
 } from './config.js';
 import { isIgnored } from './ignore.js';
-import { info, logToStderr } from './log.js';
+import { capInlineComments, MAX_INLINE_COMMENTS, selectFiles } from './limits.js';
+import {
+  buffered, flush, info, logToStderr, warn,
+} from './log.js';
 import { formatJson, formatSarif, outputFormat } from './output.js';
-import { describe as describeProvider, useProvider } from './providers/index.js';
+import { mapPool } from './pool.js';
+import { defaultConcurrency, describe as describeProvider, useProvider } from './providers/index.js';
 import { atLeast, reviewDiff } from './review.js';
 
 const SAMPLE_DIFF = fileURLToPath(new URL('../samples/buggy.diff', import.meta.url));
@@ -43,11 +50,14 @@ async function run(argv) {
     args: argv,
     options: {
       branch: { type: 'string' },
+      concurrency: { type: 'string' },
       'dry-run': { type: 'boolean', default: false },
       'fail-on': { type: 'string' },
       format: { type: 'string' },
       full: { type: 'boolean', default: false },
       ignore: { type: 'string' },
+      'max-chunks-per-file': { type: 'string' },
+      'max-files': { type: 'string' },
       'min-severity': { type: 'string' },
       'no-config': { type: 'boolean', default: false },
       'no-default-ignore': { type: 'boolean', default: false },
@@ -94,7 +104,7 @@ async function run(argv) {
   const format = outputFormat(settings.format, flags.output);
   const unreachable = failOn.filter((s) => !atLeast(s, minSeverity));
   if (unreachable.length > 0) {
-    console.warn(`Warning: --fail-on ${unreachable.join(',')} has no effect with --min-severity ${minSeverity}, which leaves those findings out.`);
+    warn(`Warning: --fail-on ${unreachable.join(',')} has no effect with --min-severity ${minSeverity}, which leaves those findings out.`);
   }
   const used = await selectProvider(settings.provider, settings.model);
   if (used === SKIPPED) return;
@@ -109,13 +119,21 @@ async function run(argv) {
     timeoutMs: settings.timeoutMs,
     ignorePatterns: settings.ignorePatterns,
     rules: config.rules,
+    concurrency: settings.concurrency ?? defaultConcurrency(),
+    maxFiles: settings.maxFiles,
+    maxChunksPerFile: settings.maxChunksPerFile,
   };
 
-  const { results, findings, seconds } = pr
+  const {
+    results, findings, seconds, notReviewed,
+  } = pr
     ? await reviewPullRequest(pr, token, details, options)
     : await reviewLocal(input, options);
-  await writeOutput(results, { format, output: flags.output, seconds });
+  await writeOutput(results, {
+    format, output: flags.output, seconds, notReviewed,
+  });
   checkFailOn(findings, failOn);
+  checkFailed(notReviewed);
 }
 
 const ONE_INPUT = 'Review one thing at a time: pass only one of --staged, --uncommitted, --branch <base>, --since <rev>, a diff file, a PR URL or - (stdin).';
@@ -189,6 +207,14 @@ function checkFailOn(findings, failOn) {
   process.exitCode = 1;
 }
 
+/** Set the exit code to 1 if a file could not be reviewed (see reviewFiles): the review is incomplete. */
+function checkFailed(notReviewed) {
+  const failed = notReviewed.filter((n) => n.failed);
+  if (failed.length === 0) return;
+  info(`\nIncomplete: ${plural(failed.length, 'file')} could not be reviewed (${failed.map((n) => n.filename).join(', ')}).`);
+  process.exitCode = 1;
+}
+
 /**
  * A fork PR's workflow gets no secrets, so in Actions a missing API key there skips the review
  * with a warning: returns true. Elsewhere it adds a hint to the error and returns false.
@@ -212,18 +238,21 @@ function flatFindings(results) {
 
 /**
  * Review a diff file, stdin or local git changes (input: see selectInput).
- * Returns { results, findings (for --fail-on), seconds }.
+ * Returns { results, findings (for --fail-on), seconds, notReviewed (see reviewFiles) }.
  */
 async function reviewLocal(input, options) {
   const { text, label, loadSource } = await localInput(input, options.repoDir);
-  const files = reviewable(splitDiff(text), options);
-  if (files.length === 0) {
+  const all = reviewable(splitDiff(text), options);
+  if (all.length === 0) {
     info(`Nothing to review in ${label}.`);
     await appendStepSummary(`reviewbuddy: nothing to review in ${label}.`);
-    return { results: [], findings: [], seconds: '0.0' };
+    return {
+      results: [], findings: [], seconds: '0.0', notReviewed: [],
+    };
   }
-  const { results, seconds } = await reviewFiles(files, options, loadSource);
-  return { results, findings: flatFindings(results), seconds };
+  const { files, notReviewed } = limitFiles(all, options);
+  const reviewed = await reviewFiles(files, options, loadSource, notReviewed);
+  return { ...reviewed, findings: flatFindings(reviewed.results) };
 }
 
 /**
@@ -272,13 +301,13 @@ function localSource(repoDir = '.', read = readWorkingTree) {
     const path = resolve(root, filename);
     const rel = relative(root, path);
     if (!rel || rel.startsWith('..') || isAbsolute(rel)) {
-      console.warn(`  Not reading ${filename} for context: it is outside ${root}.`);
+      warn(`  Not reading ${filename} for context: it is outside ${root}.`);
       return null;
     }
     try {
       return await read(path, filename);
     } catch (err) {
-      if (err.code !== 'ENOENT') console.warn(`  Could not read ${filename} for context (${err.message}), reviewing the diff alone.`);
+      if (err.code !== 'ENOENT') warn(`  Could not read ${filename} for context (${err.message}), reviewing the diff alone.`);
       return null;
     }
   };
@@ -291,18 +320,19 @@ function remoteSource(pr, token, sha) {
       return await getFileContent(pr, token, filename, sha);
     } catch (err) {
       const hint = err.status === 403 ? ' The token needs "Contents: Read" for this.' : '';
-      console.warn(`  Could not fetch ${filename} for context (${err.message}), reviewing the diff alone.${hint}`);
+      warn(`  Could not fetch ${filename} for context (${err.message}), reviewing the diff alone.${hint}`);
       return null;
     }
   };
 }
 
 /**
- * Review a PR (details: its getPullRequest reply) and post the new findings. Returns { results, findings, seconds }:
+ * Review a PR (details: its getPullRequest reply) and post the new findings. Returns { results, findings, seconds, notReviewed }:
  * results are this run's findings, including ones posted before (for --output and --format). findings are what
  * --fail-on judges: those, plus earlier inline findings whose lines haven't changed since.
  */
-async function reviewPullRequest(pr, token, { head }, options) {
+async function reviewPullRequest(pr, token, details, options) {
+  const { head, base } = details;
   const reviews = await listReviews(pr, token);
   const ourReviews = new Set(reviews.filter((r) => parseMarker(r.body)).map((r) => r.id));
   // Inline comments from our earlier reviews, fetched at most once and only when needed.
@@ -316,32 +346,40 @@ async function reviewPullRequest(pr, token, { head }, options) {
   if (previous?.sha === head.sha) {
     info(`Already reviewed ${short(head.sha)}, nothing new`);
     await appendStepSummary(`reviewbuddy already reviewed \`${short(head.sha)}\`, nothing new.`);
-    return { results: [], findings: await stillOpen(), seconds: '0.0' };
+    return {
+      results: [], findings: await stillOpen(), seconds: '0.0', notReviewed: [],
+    };
   }
 
-  const prFiles = reviewable(splitDiff(await getPullRequestDiff(pr, token)), options);
-  let files = prFiles;
+  const listed = await pullRequestFiles(pr, token, details, options);
+  const prFiles = listed.files;
+  let candidates = prFiles;
+  let { tooLarge } = listed;
   let since;
   if (previous) {
-    const newer = await filesSince(pr, token, previous.sha, head.sha, prFiles);
-    if (newer) {
-      files = newer;
+    const newer = await filesSince(pr, token, previous.sha, head.sha, listed);
+    if (newer.files) {
+      ({ files: candidates, tooLarge } = newer);
       since = short(previous.sha);
       info(`Reviewing changes since ${since}`);
     } else {
-      info(`Previous review's commit ${short(previous.sha)} no longer exists (force-push or rebase?), reviewing the whole PR.`);
+      info(newer.reason);
     }
   }
+  const { files, notReviewed: skipped } = limitFiles(candidates, options);
+  const notReviewed = [...tooLargeEntries(tooLarge, options), ...listed.notes, ...skipped];
   info(`Pull request ${pr.owner}/${pr.repo}#${pr.number}: ${files.length} file(s) to review\n`);
 
   const reviewed = files.length > 0
-    ? await reviewFiles(files, options, remoteSource(pr, token, head.sha))
-    : { results: [], seconds: '0.0' };
+    ? await reviewFiles(files, options, remoteSource(pr, token, head.sha), notReviewed)
+    : { results: [], seconds: '0.0', notReviewed: printNotReviewed(notReviewed) };
   let { results } = reviewed;
   // Judged before dropping repeats: a finding posted earlier is still in the code.
   const findings = [...flatFindings(results), ...await stillOpen()];
   // --output and --format get every finding of this run, posted before or not.
-  const done = { results: reviewed.results, findings, seconds: reviewed.seconds };
+  const done = {
+    results: reviewed.results, findings, seconds: reviewed.seconds, notReviewed: reviewed.notReviewed,
+  };
   if (ourReviews.size > 0 && countIssues(results) > 0) {
     const dropped = dropPosted(results, postedKeys(await listOurComments(), ourReviews));
     results = dropped.results;
@@ -354,9 +392,17 @@ async function reviewPullRequest(pr, token, { head }, options) {
 
   // GitHub only accepts inline comments on lines in the PR's own diff, not the compare diff.
   const prDiffs = new Map(prFiles.map((f) => [f.filename, f.diff]));
+  // A file that failed must be tried again next run, so the marker keeps the commit this run started from.
+  const incomplete = done.notReviewed.some((n) => n.failed);
   const review = buildReview(
     results.map((r) => ({ ...r, diff: prDiffs.get(r.filename) })),
-    { commitId: head.sha, since, ...describeProvider() },
+    {
+      commitId: head.sha,
+      markerSha: incomplete ? previous?.sha ?? base.sha : head.sha,
+      since,
+      notReviewed: done.notReviewed,
+      ...describeProvider(),
+    },
   );
 
   if (options.dryRun) {
@@ -377,15 +423,73 @@ async function reviewPullRequest(pr, token, { head }, options) {
   return done;
 }
 
+const TOO_LARGE = 'too large for the GitHub API';
+
 /**
- * The PR's files narrowed to what changed between sha and head, or null if GitHub no longer has sha.
- * Files the PR itself doesn't change (brought in by merging the base branch) are left out.
+ * The PR's changed files as { files, tooLarge, notes }: files to review (the ignore list applied), names of
+ * files GitHub sent no patch for, and notReviewed entries for files GitHub didn't list at all.
+ * GitHub refuses the diff format (HTTP 406) for big PRs; then the files API gives the same files, page by page.
  */
-async function filesSince(pr, token, sha, head, prFiles) {
-  const diff = await getCompareDiff(pr, token, sha, head);
-  if (diff === null) return null;
-  const inPr = new Set(prFiles.map((f) => f.filename));
-  return splitDiff(diff).filter((f) => inPr.has(f.filename));
+async function pullRequestFiles(pr, token, details, options) {
+  try {
+    return { files: reviewable(splitDiff(await getPullRequestDiff(pr, token)), options), tooLarge: [], notes: [] };
+  } catch (err) {
+    if (err.status !== 406) throw err;
+  }
+  info('The diff is too large for GitHub\'s diff format, reading the changed files page by page instead.');
+  const entries = await listPullRequestFiles(pr, token);
+  const { files, tooLarge } = filesFromApi(entries);
+  const notes = [];
+  const unlisted = (details.changed_files ?? entries.length) - entries.length;
+  if (unlisted > 0) {
+    const reason = `GitHub's files API lists at most ${MAX_PR_FILES} files, so ${plural(unlisted, 'more changed file')} could not be reviewed.`;
+    warn(`Warning: ${reason}`);
+    notes.push({ filename: null, reason });
+  }
+  return { files: reviewable(files, options), tooLarge, notes };
+}
+
+/**
+ * The PR's files narrowed to what changed between sha and head, as { files, tooLarge }, or { reason }
+ * saying why the whole PR is reviewed instead: GitHub no longer has sha, or too much changed for its compare API.
+ * Files the PR itself doesn't change (brought in by merging the base branch) are left out.
+ * listed: pullRequestFiles' result.
+ */
+async function filesSince(pr, token, sha, head, listed) {
+  const gone = { reason: `Previous review's commit ${short(sha)} no longer exists (force-push or rebase?), reviewing the whole PR.` };
+  let files;
+  let tooLarge = [];
+  try {
+    const diff = await getCompareDiff(pr, token, sha, head);
+    if (diff === null) return gone;
+    files = splitDiff(diff);
+  } catch (err) {
+    // 406: too large for the diff format. 5xx (after retries): GitHub timed out building it.
+    if (err.status !== 406 && !(err.status >= 500)) throw err;
+    info(`The changes since ${short(sha)} are too large for GitHub's diff format, reading the changed files instead.`);
+    const entries = await getCompareFiles(pr, token, sha, head);
+    if (entries === null) return gone;
+    if (entries.length >= MAX_COMPARE_FILES) {
+      return { reason: `Too many changes since ${short(sha)} for GitHub's compare API (it lists at most ${MAX_COMPARE_FILES} files), reviewing the whole PR.` };
+    }
+    ({ files, tooLarge } = filesFromApi(entries));
+  }
+  const inPr = new Set([...listed.files.map((f) => f.filename), ...listed.tooLarge]);
+  return { files: files.filter((f) => inPr.has(f.filename)), tooLarge: tooLarge.filter((name) => inPr.has(name)) };
+}
+
+/** notReviewed entries for files GitHub sent no patch for, except ignored ones. */
+function tooLargeEntries(names, { ignorePatterns }) {
+  return names.filter((name) => !isIgnored(name, ignorePatterns)).map((filename) => ({ filename, reason: TOO_LARGE }));
+}
+
+/** The files to review under --max-files (see selectFiles), as { files, notReviewed }. */
+function limitFiles(all, { maxFiles }) {
+  const { selected, skipped } = selectFiles(all, maxFiles);
+  if (skipped.length > 0) {
+    info(`Reviewing ${selected.length} of ${plural(all.length, 'file')} (--max-files ${maxFiles}): source files and the biggest changes first.\n`);
+  }
+  return { files: selected, notReviewed: skipped.map((f) => ({ filename: f.filename, reason: `over --max-files ${maxFiles}` })) };
 }
 
 function short(sha) {
@@ -396,25 +500,44 @@ function short(sha) {
  * Turn review results into the { commitId, body, comments } posted to GitHub.
  * GitHub rejects the whole review if a comment points outside the diff,
  * so findings on other lines go into the review body instead.
+ * At most MAX_INLINE_COMMENTS go inline, the most severe first; the rest are listed in the body.
  * An inline comment with a suggestion ends with a ```suggestion block that GitHub can apply in one click.
- * The body ends with a hidden marker naming commitId; since (a short SHA) says the review covers only newer commits.
+ * The body lists notReviewed (see reviewFiles) and ends with a hidden marker naming markerSha (default commitId);
+ * since (a short SHA) says the review covers only newer commits.
  */
-export function buildReview(results, { commitId, since, model, provider }) {
-  const comments = [];
+export function buildReview(results, {
+  commitId, markerSha = commitId, since, model, provider, notReviewed = [],
+}) {
+  const candidates = [];
   const leftovers = [];
   for (const { filename, diff, comments: found } of results) {
     const allowed = commentableLines(diff);
     for (const c of found) {
       const body = `**[${c.severity.toUpperCase()}]** ${c.message}`;
+      const listed = `- \`${filename}:${c.line}\` ${body}`;
       if (allowed.has(c.line)) {
-        comments.push({ path: filename, line: c.line, body: c.suggestion ? body + suggestionBlock(c.suggestion) : body });
+        const comment = { path: filename, line: c.line, body: c.suggestion ? body + suggestionBlock(c.suggestion) : body };
+        candidates.push({ comment, severity: c.severity, listed });
       } else {
-        leftovers.push(`- \`${filename}:${c.line}\` ${body}`);
+        leftovers.push(listed);
       }
     }
   }
-  const body = `${reviewBody(results, leftovers, { since, model, provider })}\n\n${markerFor(commitId)}`;
-  return { commitId, body, comments };
+  const { inline, overflow } = capInlineComments(candidates);
+  const text = reviewBody(results, {
+    leftovers, overflow: overflow.map((c) => c.listed), notReviewed, since, model, provider,
+  });
+  return { commitId, body: `${fitBody(text)}\n\n${markerFor(markerSha)}`, comments: inline.map((c) => c.comment) };
+}
+
+// GitHub refuses longer bodies (65,536 characters); this leaves room for the marker.
+const MAX_BODY_CHARS = 60_000;
+
+/** text cut at a line break to fit MAX_BODY_CHARS, saying where the rest is. */
+function fitBody(text) {
+  if (text.length <= MAX_BODY_CHARS) return text;
+  const cut = text.slice(0, text.lastIndexOf('\n', MAX_BODY_CHARS));
+  return `${cut}\n\n_The summary was too long for one GitHub review and was cut here. The job summary and --output have everything._`;
 }
 
 /** A GitHub suggestion block replacing the commented line with code. The fence outgrows any backticks in it. */
@@ -434,57 +557,123 @@ function reviewable(files, { ignorePatterns }) {
   return kept;
 }
 
-function reviewBody(results, leftovers, { since, model, provider }) {
+function reviewBody(results, {
+  leftovers, overflow, notReviewed, since, model, provider,
+}) {
   const total = countIssues(results);
   const scope = `${plural(results.length, 'file')}${since ? ` since \`${since}\`` : ''}`;
   const by = `model \`${model}\`${provider ? ` via ${provider}` : ''}`;
   const lines = [total === 0
     ? `reviewbuddy found no issues in ${scope} (${by}).`
     : `reviewbuddy found ${plural(total, 'issue')} in ${scope} (${by}).`];
+  if (overflow.length > 0) {
+    lines.push('', `Only the ${MAX_INLINE_COMMENTS} most severe findings are posted inline, so the review stays readable. The other ${overflow.length}:`, ...overflow);
+  }
   if (leftovers.length > 0) {
     lines.push('', 'These point at lines outside the diff, so they could not be posted inline:', ...leftovers);
+  }
+  if (notReviewed.length > 0) {
+    lines.push('', 'Not reviewed:', ...notReviewed.map(notReviewedLine));
   }
   return lines.join('\n');
 }
 
+/** One notReviewed entry as a Markdown list item. */
+function notReviewedLine({ filename, reason }) {
+  return filename ? `- \`${filename}\`: ${reason}` : `- ${reason}`;
+}
+
 /**
- * Review each file, print the findings, and return { results: [{ filename, diff, comments }], seconds }.
+ * Review the files, up to concurrency at once, print the findings, and return
+ * { results: [{ filename, diff, comments }], seconds, notReviewed }.
+ * Each file's output is held back and printed as one block when it finishes; results keep the files' order.
+ * A file that fails (after retries) doesn't stop the others: it goes into notReviewed as { filename, reason, failed: true }.
+ * An error that would fail every file (fatal: a bad API key, an unknown model) stops the run.
+ * notReviewed starts as skipped ([{ filename, reason }], left out before reviewing) and gains the failed files
+ * and the partly reviewed ones (over --max-chunks-per-file; their findings are still in results).
  * loadSource(filename) gives the file's new version for context, or null.
  * Findings below minSeverity are left out here, so nothing later sees them: not --fail-on, and not any output format.
  */
 async function reviewFiles(files, {
-  timeoutMs, minSeverity, rules,
-}, loadSource) {
+  timeoutMs, minSeverity, rules, concurrency = 1, maxChunksPerFile = 0,
+}, loadSource, skipped = []) {
   const start = performance.now();
-  const results = [];
-  let below = 0;
+  let finished = 0;
+  info(`Reviewing ${plural(files.length, 'file')} with concurrency ${concurrency}\n`);
 
-  for (const [i, file] of files.entries()) {
-    info(`Reviewing ${file.filename} (${i + 1}/${files.length}) ...`);
-    const source = await loadSource(file.filename);
-    const found = await reviewDiff(file.filename, file.diff, { timeoutMs, source, rules });
-    const comments = found.filter((c) => atLeast(c.severity, minSeverity));
-    below += found.length - comments.length;
-    results.push({ ...file, comments });
-
-    for (const c of comments) {
-      info(`  ${file.filename}:${c.line} [${c.severity.toUpperCase()}] ${c.message}`);
-      if (c.suggestion) info(`    fix: ${c.suggestion.trim()}`);
+  const outcomes = await mapPool(files, concurrency, async (file) => {
+    let partial;
+    const review = async () => reviewDiff(file.filename, file.diff, {
+      timeoutMs,
+      source: await loadSource(file.filename),
+      rules,
+      maxChunks: maxChunksPerFile,
+      onPartial: (p) => { partial = p; },
+    });
+    try {
+      const { value: found, lines } = await buffered(review);
+      const comments = found.filter((c) => atLeast(c.severity, minSeverity));
+      printFile(file, ++finished, files.length, lines, comments);
+      return { comments, below: found.length - comments.length, partial };
+    } catch (err) {
+      info(`Could not review ${file.filename} (${++finished}/${files.length})`);
+      flush(err.lines);
+      // A fatal error ends the run, which prints it.
+      if (!err.fatal) warn(`  ${err.message}\n`);
+      throw err;
     }
-    if (comments.length === 0) info('  No issues found.');
-    info();
+  });
+
+  const results = [];
+  const notReviewed = [...skipped];
+  let below = 0;
+  for (const [i, { value, error }] of outcomes.entries()) {
+    const { filename } = files[i];
+    if (error) {
+      notReviewed.push({ filename, reason: `failed: ${error.message.split('\n')[0]}`, failed: true });
+      continue;
+    }
+    results.push({ ...files[i], comments: value.comments });
+    below += value.below;
+    if (value.partial) {
+      const { reviewed, total } = value.partial;
+      notReviewed.push({ filename, reason: `partly reviewed: the first ${reviewed} of ${total} parts (--max-chunks-per-file)` });
+    }
   }
 
   const seconds = ((performance.now() - start) / 1000).toFixed(1);
-  info(`${plural(countIssues(results), 'issue')} in ${plural(files.length, 'file')}. Review took ${seconds}s`);
+  info(`${plural(countIssues(results), 'issue')} in ${plural(results.length, 'file')}. Review took ${seconds}s`);
   if (below > 0) info(`Left out ${plural(below, 'finding')} below --min-severity ${minSeverity}.`);
+  printNotReviewed(notReviewed);
 
   if (inActions()) {
     // Annotations show on the run page and in the PR's "Files changed" view; the report goes in the job summary.
     for (const line of annotationsFor(results)) info(line);
-    await appendStepSummary(formatReport(results, { ...describeProvider(), seconds, date: new Date() }));
+    await appendStepSummary(formatReport(results, {
+      ...describeProvider(), seconds, date: new Date(), notReviewed,
+    }));
   }
-  return { results, seconds };
+  return { results, seconds, notReviewed };
+}
+
+/** Print a finished file as one block: its running count, what it printed while reviewed, then its findings. */
+function printFile(file, finished, total, lines, comments) {
+  info(`Reviewed ${file.filename} (${finished}/${total})`);
+  flush(lines);
+  for (const c of comments) {
+    info(`  ${file.filename}:${c.line} [${c.severity.toUpperCase()}] ${c.message}`);
+    if (c.suggestion) info(`    fix: ${c.suggestion.trim()}`);
+  }
+  if (comments.length === 0) info('  No issues found.');
+  info();
+}
+
+/** Print the files left out or only partly reviewed, if any. Returns notReviewed. */
+function printNotReviewed(notReviewed) {
+  if (notReviewed.length === 0) return notReviewed;
+  info(`\nNot reviewed (${notReviewed.length}):`);
+  for (const n of notReviewed) info(`  ${n.filename ? `${n.filename}: ${n.reason}` : n.reason}`);
+  return notReviewed;
 }
 
 /**
@@ -492,15 +681,19 @@ async function reviewFiles(files, {
  * SARIF document to stdout (text was already printed). Called once per run, also when nothing was reviewed,
  * so a consumer always gets a document.
  */
-async function writeOutput(results, { format, output, seconds }) {
+async function writeOutput(results, {
+  format, output, seconds, notReviewed = [],
+}) {
   if (format === 'text') {
     if (!output) return;
-    const filePath = await writeReport(results, { seconds, outputPath: output });
+    const filePath = await writeReport(results, { seconds, outputPath: output, notReviewed });
     info(`\nReport written to ${filePath}`);
     return;
   }
   const used = describeProvider();
-  const doc = format === 'json' ? formatJson(results, { ...used, seconds }) : formatSarif(results, used);
+  const doc = format === 'json'
+    ? formatJson(results, { ...used, seconds, notReviewed })
+    : formatSarif(results, { ...used, notReviewed });
   const text = `${JSON.stringify(doc, null, 2)}\n`;
   if (!output) {
     process.stdout.write(text);
@@ -521,8 +714,10 @@ function plural(count, word) {
 
 const SEVERITY_ICON = { security: '🔴', bug: '🟠', performance: '🟡', suggestion: '🔵' };
 
-/** Render review results as a Markdown report. */
-export function formatReport(results, { model, provider, seconds, date }) {
+/** Render review results as a Markdown report. notReviewed (see reviewFiles) gets a section at the end. */
+export function formatReport(results, {
+  model, provider, seconds, date, notReviewed = [],
+}) {
   const total = countIssues(results);
   const lines = [
     '# 🔍 ReviewBuddy Report',
@@ -535,6 +730,7 @@ export function formatReport(results, { model, provider, seconds, date }) {
     `| Model | \`${model}\` |`,
     `| Date | ${date.toLocaleString()} |`,
     `| Files reviewed | ${results.length} |`,
+    ...(notReviewed.length > 0 ? [`| Not reviewed | ${notReviewed.length} |`] : []),
     '',
     '---',
     '',
@@ -557,6 +753,7 @@ export function formatReport(results, { model, provider, seconds, date }) {
     }
     lines.push('');
   }
+  if (notReviewed.length > 0) lines.push('## Not reviewed', '', ...notReviewed.map(notReviewedLine), '');
   return lines.join('\n');
 }
 
@@ -571,9 +768,13 @@ function inlineCode(code) {
  * Write the Markdown report to outputPath and return its absolute path.
  * model and provider default to the selected provider.
  */
-export async function writeReport(results, { seconds, outputPath, date = new Date(), ...used }) {
+export async function writeReport(results, {
+  seconds, outputPath, date = new Date(), notReviewed, ...used
+}) {
   const filePath = resolve(outputPath);
   const { model, provider } = used.model ? used : describeProvider();
-  await writeFile(filePath, formatReport(results, { model, provider, seconds, date }), 'utf8');
+  await writeFile(filePath, formatReport(results, {
+    model, provider, seconds, date, notReviewed,
+  }), 'utf8');
   return filePath;
 }
