@@ -17,7 +17,7 @@ const REPLY = '{"comments":[]}';
 const KEY = 'sk-secret-test-key';
 
 const PROVIDER_VARS = [
-  'REVIEWBUDDY_PROVIDER', 'OLLAMA_MODEL',
+  'REVIEWBUDDY_PROVIDER', 'OLLAMA_MODEL', 'OLLAMA_URL',
   'GROQ_API_KEY', 'GROQ_MODEL', 'OPENROUTER_API_KEY', 'OPENROUTER_MODEL',
   'GEMINI_API_KEY', 'GEMINI_MODEL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_MODEL',
   // When the tests themselves run in GitHub Actions.
@@ -70,13 +70,20 @@ test('every provider has a prompt budget, and Ollama\'s fits its 8192-token cont
   assert.deepEqual(budgets, { ollama: 16_000, groq: 24_000, openrouter: 40_000, gemini: 60_000, anthropic: 60_000 });
 });
 
-test('useProvider reads REVIEWBUDDY_PROVIDER, and a name passed in wins over it', () => {
-  process.env.REVIEWBUDDY_PROVIDER = 'groq';
+test('useProvider takes the name in any case, and the model it is given over the default', () => {
   process.env.GROQ_API_KEY = KEY;
   process.env.GEMINI_API_KEY = KEY;
-  assert.deepEqual(useProvider(), { provider: 'groq', model: 'openai/gpt-oss-20b' });
   assert.deepEqual(useProvider('Gemini'), { provider: 'gemini', model: 'gemini-3.8-flash' });
-  assert.deepEqual(describe(), { provider: 'gemini', model: 'gemini-3.8-flash' });
+  assert.deepEqual(useProvider('groq', { model: 'llama-3.3-70b-versatile' }), { provider: 'groq', model: 'llama-3.3-70b-versatile' });
+  assert.deepEqual(describe(), { provider: 'groq', model: 'llama-3.3-70b-versatile' });
+});
+
+test('chat sends the model useProvider was given', async () => {
+  process.env.GROQ_API_KEY = KEY;
+  useProvider('groq', { model: 'from-config' });
+  const requests = mockFetch(Response.json({ choices: [{ message: { content: REPLY } }] }));
+  await chat('sys', 'user', SCHEMA);
+  assert.equal(requests[0].body.model, 'from-config');
 });
 
 test('useProvider rejects an unknown provider', () => {

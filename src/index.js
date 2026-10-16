@@ -12,13 +12,16 @@ import { commentableLines, splitDiff } from './diff.js';
 import {
   getCompareDiff, getFileContent, getPullRequest, getPullRequestDiff, listReviewComments, listReviews, parsePrUrl, postReview,
 } from './github.js';
-import { DEFAULT_IGNORE, isIgnored, parsePatterns } from './ignore.js';
-import { describe as describeProvider, useProvider } from './providers/index.js';
 import {
-  atLeast, reviewDiff, SEVERITIES, SEVERITY_ORDER,
-} from './review.js';
+  findLocalConfig, loadConfig, loadRemoteConfig, resolveSettings,
+} from './config.js';
+import { isIgnored } from './ignore.js';
+import { describe as describeProvider, useProvider } from './providers/index.js';
+import { atLeast, reviewDiff } from './review.js';
 
 const SAMPLE_DIFF = fileURLToPath(new URL('../samples/buggy.diff', import.meta.url));
+
+export { parseFailOn, parseMinSeverity } from './config.js';
 
 /** Run the CLI with the given arguments (process.argv without node and the script). */
 export async function main(argv) {
@@ -30,6 +33,7 @@ export async function main(argv) {
       full: { type: 'boolean', default: false },
       ignore: { type: 'string' },
       'min-severity': { type: 'string' },
+      'no-config': { type: 'boolean', default: false },
       'no-default-ignore': { type: 'boolean', default: false },
       output: { type: 'string', short: 'o' },
       provider: { type: 'string' },
@@ -39,30 +43,39 @@ export async function main(argv) {
     allowPositionals: true,
   });
 
-  const failOn = parseFailOn(flags['fail-on'] ?? process.env.REVIEWBUDDY_FAIL_ON);
-  const minSeverity = parseMinSeverity(flags['min-severity'] ?? process.env.REVIEWBUDDY_MIN_SEVERITY);
-  const unreachable = failOn.filter((s) => !atLeast(s, minSeverity));
-  if (unreachable.length > 0) {
-    console.warn(`Warning: --fail-on ${unreachable.join(',')} has no effect with --min-severity ${minSeverity}, which leaves those findings out.`);
-  }
+  const target = positionals[0] || SAMPLE_DIFF;
+  const pr = parsePrUrl(target);
   const repoDir = flags['repo-dir'];
   if (repoDir !== undefined && !(await stat(repoDir).catch(() => null))?.isDirectory()) {
     throw new Error(`--repo-dir ${repoDir} is not a directory.`);
   }
 
-  // Fail now on an unknown provider or a missing API key, rather than mid-review.
-  let used;
-  try {
-    used = useProvider(flags.provider);
-  } catch (err) {
-    if (await skipWithoutKey(err)) return;
-    throw err;
+  // Check flags and variables now, before any request. A provider they name wins over the
+  // repo's config, so an unknown one or a missing API key fails here too.
+  const early = resolveSettings({ flags, env: process.env });
+  if (early.providerSource !== 'default' && await selectProvider(early.provider) === SKIPPED) return;
+
+  const token = process.env.GITHUB_TOKEN;
+  let details;
+  if (pr) {
+    // Fail now rather than after several minutes of model calls.
+    if (!token && !flags['dry-run']) {
+      throw new Error('Set GITHUB_TOKEN to post a review, or pass --dry-run to only print it.');
+    }
+    details = await getPullRequest(pr, token);
   }
-  const { provider, model } = used;
-  if (provider === 'ollama' && inActions() && !process.env.OLLAMA_URL) {
-    throw new Error('Ollama doesn\'t run on GitHub-hosted runners. Set the provider input to groq, openrouter, gemini or anthropic and pass its API key, or set OLLAMA_URL to a server the runner can reach.');
+  const config = await repoConfig(flags['no-config'], pr, token, details, repoDir);
+  if (config.summary) console.log(config.summary);
+
+  const settings = resolveSettings({ flags, env: process.env, file: config.file });
+  const { failOn, minSeverity } = settings;
+  const unreachable = failOn.filter((s) => !atLeast(s, minSeverity));
+  if (unreachable.length > 0) {
+    console.warn(`Warning: --fail-on ${unreachable.join(',')} has no effect with --min-severity ${minSeverity}, which leaves those findings out.`);
   }
-  console.log(`Using ${provider} (${model})\n`);
+  const used = await selectProvider(settings.provider, settings.model);
+  if (used === SKIPPED) return;
+  console.log(`Using ${used.provider} (${used.model})\n`);
 
   const options = {
     dryRun: flags['dry-run'],
@@ -71,39 +84,44 @@ export async function main(argv) {
     minSeverity,
     output: flags.output,
     repoDir,
-    timeoutMs: parseTimeout(flags.timeout ?? process.env.REVIEWBUDDY_TIMEOUT),
-    ignorePatterns: [
-      ...(flags['no-default-ignore'] ? [] : DEFAULT_IGNORE),
-      ...parsePatterns(process.env.REVIEWBUDDY_IGNORE),
-      ...parsePatterns(flags.ignore),
-    ],
+    timeoutMs: settings.timeoutMs,
+    ignorePatterns: settings.ignorePatterns,
+    rules: config.rules,
   };
 
-  const target = positionals[0] || SAMPLE_DIFF;
-  const pr = parsePrUrl(target);
-  const findings = pr ? await reviewPullRequest(pr, options) : await reviewDiffFile(target, options);
+  const findings = pr ? await reviewPullRequest(pr, token, details, options) : await reviewDiffFile(target, options);
   checkFailOn(findings, failOn);
 }
 
-/** Severities from --fail-on or REVIEWBUDDY_FAIL_ON ("security,bug"). [] means never fail. */
-export function parseFailOn(value) {
-  if (!value) return [];
-  const wanted = value.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-  const unknown = wanted.find((s) => !SEVERITIES.includes(s));
-  if (unknown !== undefined) {
-    throw new Error(`Unknown severity "${unknown}" in --fail-on. Use a comma-separated list of: ${SEVERITIES.join(', ')}.`);
+const SKIPPED = Symbol('skipped');
+
+/**
+ * Select the provider and model, or throw if that's impossible: an unknown name, a missing API key,
+ * Ollama on a GitHub-hosted runner. Returns describe(), or SKIPPED for a fork PR without a key.
+ */
+async function selectProvider(name, model) {
+  let used;
+  try {
+    used = useProvider(name, { model });
+  } catch (err) {
+    if (await skipWithoutKey(err)) return SKIPPED;
+    throw err;
   }
-  return [...new Set(wanted)];
+  if (used.provider === 'ollama' && inActions() && !process.env.OLLAMA_URL) {
+    throw new Error('Ollama doesn\'t run on GitHub-hosted runners. Set the provider input to groq, openrouter, gemini or anthropic and pass its API key, or set OLLAMA_URL to a server the runner can reach.');
+  }
+  return used;
 }
 
-/** The least serious severity to keep, from --min-severity or REVIEWBUDDY_MIN_SEVERITY. undefined keeps everything. */
-export function parseMinSeverity(value) {
-  const wanted = value?.trim().toLowerCase();
-  if (!wanted) return undefined;
-  if (!SEVERITY_ORDER.includes(wanted)) {
-    throw new Error(`Unknown severity "${value.trim()}" in --min-severity. Use one of: ${SEVERITY_ORDER.join(', ')}.`);
-  }
-  return wanted;
+/**
+ * The reviewed repo's .reviewbuddy.json and .reviewbuddy.md, parsed (see loadConfig).
+ * For a PR they come from its base commit, not its head (see loadRemoteConfig for why);
+ * for a diff file from repoDir or the current directory, or a parent up to the git root.
+ */
+async function repoConfig(skip, pr, token, details, repoDir) {
+  if (skip) return { file: {}, rules: undefined, summary: null };
+  const found = pr ? await loadRemoteConfig(pr, token, details.base) : await findLocalConfig(repoDir ?? '.');
+  return loadConfig(found);
 }
 
 /**
@@ -138,16 +156,6 @@ async function skipWithoutKey(err) {
 /** [{ filename, line, severity }] for every finding in results. */
 function flatFindings(results) {
   return results.flatMap((r) => r.comments.map((c) => ({ filename: r.filename, line: c.line, severity: c.severity })));
-}
-
-/** Seconds from --timeout or REVIEWBUDDY_TIMEOUT, in milliseconds. undefined = the default. */
-function parseTimeout(value) {
-  if (value === undefined || value === '') return undefined;
-  const seconds = Number(value);
-  if (!Number.isFinite(seconds) || seconds < 0) {
-    throw new Error(`Invalid timeout "${value}": give a number of seconds, or 0 for no limit.`);
-  }
-  return seconds * 1000;
 }
 
 /** Review a diff file and return its findings, for --fail-on. */
@@ -198,17 +206,10 @@ function remoteSource(pr, token, sha) {
 }
 
 /**
- * Review a PR and post the new findings. Returns what --fail-on judges: this run's findings,
- * including ones posted before, plus earlier inline findings whose lines haven't changed since.
+ * Review a PR (details: its getPullRequest reply) and post the new findings. Returns what --fail-on judges:
+ * this run's findings, including ones posted before, plus earlier inline findings whose lines haven't changed since.
  */
-async function reviewPullRequest(pr, options) {
-  const token = process.env.GITHUB_TOKEN;
-  // Fail now rather than after several minutes of model calls.
-  if (!token && !options.dryRun) {
-    throw new Error('Set GITHUB_TOKEN to post a review, or pass --dry-run to only print it.');
-  }
-
-  const { head } = await getPullRequest(pr, token);
+async function reviewPullRequest(pr, token, { head }, options) {
   const reviews = await listReviews(pr, token);
   const ourReviews = new Set(reviews.filter((r) => parseMarker(r.body)).map((r) => r.id));
   // Inline comments from our earlier reviews, fetched at most once and only when needed.
@@ -353,7 +354,9 @@ function reviewBody(results, leftovers, { since, model, provider }) {
  * loadSource(filename) gives the file's new version for context, or null.
  * Findings below minSeverity are left out here, so nothing later sees them.
  */
-async function reviewFiles(files, { output, timeoutMs, minSeverity }, loadSource) {
+async function reviewFiles(files, {
+  output, timeoutMs, minSeverity, rules,
+}, loadSource) {
   const start = performance.now();
   const results = [];
   let below = 0;
@@ -361,7 +364,7 @@ async function reviewFiles(files, { output, timeoutMs, minSeverity }, loadSource
   for (const [i, file] of files.entries()) {
     console.log(`Reviewing ${file.filename} (${i + 1}/${files.length}) ...`);
     const source = await loadSource(file.filename);
-    const found = await reviewDiff(file.filename, file.diff, { timeoutMs, source });
+    const found = await reviewDiff(file.filename, file.diff, { timeoutMs, source, rules });
     const comments = found.filter((c) => atLeast(c.severity, minSeverity));
     below += found.length - comments.length;
     results.push({ ...file, comments });

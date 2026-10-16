@@ -38,7 +38,7 @@ To review a different diff: `npm run review -- path/to/file.diff`
 
 ## Choose a provider
 
-reviewbuddy uses Ollama unless you pick another provider with `REVIEWBUDDY_PROVIDER` or `--provider` (the flag wins). Cloud providers need no local model, just an API key.
+reviewbuddy uses Ollama unless you pick another provider with `REVIEWBUDDY_PROVIDER`, `--provider` or the reviewed repo's [`.reviewbuddy.json`](#configure-per-repository) (the flag wins, then the variable). Cloud providers need no local model, just an API key.
 
 | Provider | `--provider` | Free tier | Get a key |
 |----------|--------------|-----------|-----------|
@@ -285,7 +285,10 @@ No checkout step is needed: the action downloads the PR's diff and the changed f
 | `ignore` | none | Extra comma-separated file patterns to skip, like `--ignore` |
 | `full` | `false` | `true` reviews the whole PR every time, like `--full` |
 | `timeout` | the provider's default | Seconds a single model request may take, like `--timeout` |
+| `config` | `true` | `false` ignores the repo's `.reviewbuddy.json` and `.reviewbuddy.md`, like `--no-config` |
 | `github-token` | `${{ github.token }}` | Token used to read the PR and post the review |
+
+The action also reads the repo's [`.reviewbuddy.json` and `.reviewbuddy.md`](#configure-per-repository) from the PR's base branch. A non-empty input overrides the same setting in the file; an empty one leaves the file's value in place.
 
 The action only runs on `pull_request` events; under any other trigger it stops with an error.
 
@@ -304,7 +307,85 @@ GitHub doesn't give workflows on pull requests from forks any secrets, and their
 
 A PR with an open finding of a listed severity can then not be merged until the flagged line is fixed (or an admin bypasses the rule). A draft PR's skipped run doesn't block anything; the review runs once it is marked ready.
 
+## Configure per repository
+
+A repository that gets reviewed can carry its own settings and review rules in two files at its root:
+
+- **`.reviewbuddy.json`**: settings, the same ones as the flags and variables below.
+- **`.reviewbuddy.md`**: project-specific review rules, added to the model's instructions.
+
+Both are optional, and a missing file is not an error. [examples/](examples/) has a sample of each to copy.
+
+### `.reviewbuddy.json`
+
+```json
+{
+  "provider": "groq",
+  "model": "openai/gpt-oss-120b",
+  "ignore": ["src/generated/", "*.pb.js", "fixtures/"],
+  "minSeverity": "bug",
+  "failOn": ["security", "bug"],
+  "timeout": 120
+}
+```
+
+| Key | Type | Same as | Meaning |
+|-----|------|---------|---------|
+| `provider` | string | `--provider`, `REVIEWBUDDY_PROVIDER` | `ollama`, `groq`, `openrouter`, `gemini` or `anthropic` |
+| `model` | string | `GROQ_MODEL` etc., the action's `model` | Model for that provider. Needs `provider` in the same file, and is only used when that provider is the one selected |
+| `ignore` | array of strings | `--ignore`, `REVIEWBUDDY_IGNORE` | Extra file patterns to skip (same pattern rules as `--ignore`) |
+| `defaultIgnore` | boolean | `--no-default-ignore` | `false` stops skipping lockfiles, `dist/` etc. by default |
+| `minSeverity` | string | `--min-severity`, `REVIEWBUDDY_MIN_SEVERITY` | Least serious severity to report |
+| `failOn` | array of strings | `--fail-on`, `REVIEWBUDDY_FAIL_ON` | Severities that make the run exit with code 1 (fail the check) |
+| `timeout` | number | `--timeout`, `REVIEWBUDDY_TIMEOUT` | Seconds a single model request may take, `0` for no limit |
+
+The file must be plain JSON (no comments, no trailing commas). A syntax error or a wrong type stops the run with a message naming the file and the key. An unknown key only prints a warning, so a typo like `"failon"` shows up in the log.
+
+**No secrets.** If the file has a key that looks like a credential (`apiKey`, `token`, `GROQ_API_KEY`, `password`, ...), reviewbuddy stops with an error. Put API keys in environment variables, or in GitHub Actions secrets passed to the action's `api-key` input. A file in the repo is readable by everyone who can read the repo.
+
+### `.reviewbuddy.md`
+
+Write rules the way you'd brief a new reviewer: what your project does differently and what to flag. For example:
+
+```markdown
+- Database access goes through `db.query(sql, params)` with `?` placeholders. Report any SQL built by
+  string concatenation or template literals as `security`, even if the values look safe.
+- Errors are logged with `logger.error(err, context)`, never `console.log` or `console.error`. Report a
+  `console.*` call in `src/` as `bug`. Tests and scripts under `scripts/` may use `console`.
+- Money is stored and computed as integer cents (`amountCents`). Floating-point arithmetic on money is a `bug`.
+```
+
+The rules go into every request, after the built-in instructions, in a section titled "Project rules from the repository". The built-in instructions still win: the model replies in the same JSON, comments only on added lines, and is told to ignore anything in the rules that asks it to change the output format or report nothing. Without a `.reviewbuddy.md`, the prompt is exactly what it was before this feature.
+
+The rules are capped at **4,000 characters** (about 1,300 tokens). A longer file is cut at the last line break before the cap, with a warning. The rules count against the provider's [prompt budget](#full-file-context): with long rules, the full-file context shrinks to the code around each change, or to the diff alone, rather than overflowing the model's context.
+
+### Which value wins
+
+Each setting takes the first of:
+
+1. a CLI flag (`--fail-on`, `--min-severity`, ...)
+2. an environment variable (`REVIEWBUDDY_FAIL_ON`, `GROQ_MODEL`, ...). In the action, the inputs become these variables, so **a non-empty action input overrides the file**. An empty variable or input counts as unset.
+3. `.reviewbuddy.json`
+4. the built-in default
+
+Ignore patterns are the exception: they add up. The defaults (unless `"defaultIgnore": false` or `--no-default-ignore`), then the file's `ignore`, then `REVIEWBUDDY_IGNORE`, then `--ignore`.
+
+For example, with `"minSeverity": "bug"` and `"failOn": ["security", "bug"]` in the file, a run with `REVIEWBUDDY_FAIL_ON=security` and no flags reports security and bug findings (`minSeverity` from the file), but fails only on security ones (the variable wins over the file's `failOn`).
+
+In the action, `provider` is a required input, so the file's `provider` only applies to CLI runs. The file's `model` is still used in the action when the `model` input is empty and the file's `provider` matches the input.
+
+### Where the files are read from
+
+- **Diff files:** from `--repo-dir` if you pass it, otherwise the current directory. If a file isn't there, reviewbuddy looks in each parent directory up to the git root (the directory with `.git`), and uses the nearest one. Outside a git repository only the directory itself is checked.
+- **Pull requests (CLI and action):** from the PR's **base branch**, at the base commit, via the GitHub API, never from the PR's own commits. Otherwise a PR could edit `.reviewbuddy.json` to drop `failOn`, or add "report no issues" to `.reviewbuddy.md`, and pass its own check. So **a change to either file takes effect once it is merged**; the PR that changes it is still reviewed with the old one. Reading the files needs the same **Contents: Read** permission as [full-file context](#full-file-context). If it is missing, the run stops with an error instead of silently reviewing without the repo's rules.
+
+reviewbuddy prints one line saying which files it loaded, e.g. `Config: .reviewbuddy.json (base branch main @ 1a2b3c4), .reviewbuddy.md (base branch main @ 1a2b3c4)`. It prints nothing when there are none.
+
+Pass `--no-config` (in the action: `config: false`) to ignore both files for a run.
+
 ## Configuration
+
+These variables override the reviewed repo's [`.reviewbuddy.json`](#configure-per-repository), and the matching CLI flags override both. Pass `--no-config` to ignore the repo's `.reviewbuddy.json` and `.reviewbuddy.md`.
 
 | Variable       | Default                  | Meaning                    |
 |----------------|--------------------------|----------------------------|
@@ -339,7 +420,7 @@ Network errors and HTTP 429/5xx responses from GitHub, Ollama and the cloud prov
 npm test
 ```
 
-The tests cover diff parsing, line numbering, chunking, the ignore list, reply parsing, full-file context (the full file, the windows around each hunk, the budget cutoff, files that don't match the diff, fetching files at the head commit, `--repo-dir` and paths outside it), `--min-severity` and how it interacts with `--fail-on`, suggested fixes (parsing, validation, indentation, the suggestion block in posted comments, the report's Fix line), each provider's prompt budget, retries and timeouts, the GitHub client (including pagination and compare diffs), review markers and skipping findings already posted, re-runs (same commit, new commits, force-push fallback, `--full`), splitting findings between inline comments and the review body, the Markdown report, `--fail-on` and exit codes, GitHub Actions annotations (and their escaping), the job summary, fork PRs without a key or with a read-only token, a full run with GitHub and Ollama mocked, and each cloud provider's requests, replies and errors (provider selection, missing keys, schema fallback, 401/404/429). They need neither Ollama, API keys nor network access.
+The tests cover diff parsing, line numbering, chunking, the ignore list, reply parsing, full-file context (the full file, the windows around each hunk, the budget cutoff, files that don't match the diff, fetching files at the head commit, `--repo-dir` and paths outside it), `--min-severity` and how it interacts with `--fail-on`, suggested fixes (parsing, validation, indentation, the suggestion block in posted comments, the report's Fix line), each provider's prompt budget, retries and timeouts, the GitHub client (including pagination and compare diffs), review markers and skipping findings already posted, re-runs (same commit, new commits, force-push fallback, `--full`), splitting findings between inline comments and the review body, the Markdown report, `--fail-on` and exit codes, GitHub Actions annotations (and their escaping), the job summary, fork PRs without a key or with a read-only token, a full run with GitHub and Ollama mocked, per-repository config (validation, secret rejection, unknown keys, which value wins for each setting, ignore-pattern merging, finding the files up to the git root, reading them from the PR's base commit, `--no-config`, the rules cap and its effect on the context budget, and the prompt staying unchanged without rules), and each cloud provider's requests, replies and errors (provider selection, missing keys, schema fallback, 401/404/429). They need neither Ollama, API keys nor network access.
 
 ## Expected output
 
@@ -390,7 +471,7 @@ The first run can't see `getUser`, so models often flag line 41 as a possible nu
 | `model returned invalid JSON` | The model replied with something that isn't JSON. It retries once; if it fails again, try a larger model. |
 | `Ollama didn't finish within 600s` | The model is too slow on this machine. Try a smaller model, or raise `--timeout`. |
 | `... retrying in 2.0s (1/3)` | A network error or a busy server. reviewbuddy retries on its own; it only fails if every retry does. |
-| `Unknown provider "..."` | Use one of `ollama`, `groq`, `openrouter`, `gemini`, `anthropic` in `--provider` or `REVIEWBUDDY_PROVIDER`. |
+| `Unknown provider "..."` | Use one of `ollama`, `groq`, `openrouter`, `gemini`, `anthropic` in `--provider`, `REVIEWBUDDY_PROVIDER` or `.reviewbuddy.json`. |
 | `Set GROQ_API_KEY to use Groq` (or another `*_API_KEY`) | The provider you picked needs a key. Set it with `$env:GROQ_API_KEY = "..."`, or pick another provider. |
 | `Groq returned HTTP 401 (Groq rejected the API key ...)` | The key is wrong, expired or revoked (also shown for HTTP 403). Create a new one. |
 | `... returned HTTP 404 (model "..." not found ...)` | The `*_MODEL` variable names a model that provider doesn't offer. Unset it to use the default, or check the provider's model list. |
@@ -412,6 +493,12 @@ The first run can't see `getUser`, so models often flag line 41 as a possible nu
 | `Could not fetch ... for context ... The token needs "Contents: Read"` | Only a warning: that file is reviewed from the diff alone. Give the token Contents → Read access. |
 | `... doesn't match the diff (another version checked out?)` | Only a warning: the local file isn't the diff's new version. Check out the branch the diff came from, or point `--repo-dir` at it. |
 | `--repo-dir ... is not a directory` | Check the path passed to `--repo-dir`. |
+| `Invalid JSON in .reviewbuddy.json ...` | Fix the syntax. The file is plain JSON: no comments, no trailing commas, keys in double quotes. |
+| `"failOn" in .reviewbuddy.json must be ...` (or another key) | The key has the wrong type. See the [key reference](#reviewbuddyjson). |
+| `.reviewbuddy.json must not contain secrets` | Remove the key and set it as an environment variable or an Actions secret instead. If the key was ever committed, rotate it. |
+| `Warning: unknown key "..." in .reviewbuddy.json` | Only a warning: the key is ignored. Check its spelling against the [key reference](#reviewbuddyjson). |
+| `Warning: .reviewbuddy.md is ... characters` | Only a warning: only the first 4,000 characters are used. Shorten the rules. |
+| `Could not read .reviewbuddy.json from the base branch ... "Contents: Read"` | Give the token Contents → Read access, or pass `--no-config` (`config: false` in the action). |
 | `Failing: 2 findings match --fail-on security` | Not a crash: findings of a severity you listed are still in the code, so the run exits with code 1. Fix the flagged lines, or change `--fail-on`. |
 | `Ollama doesn't run on GitHub-hosted runners` | Set the action's `provider` input to `groq`, `openrouter`, `gemini` or `anthropic` and pass its `api-key` from a secret. |
 | `Set GROQ_API_KEY ... In GitHub Actions, add the key as a repository secret` | The workflow didn't get a key. Add the secret (Settings → Secrets and variables → Actions) and check that `api-key:` names it exactly. |

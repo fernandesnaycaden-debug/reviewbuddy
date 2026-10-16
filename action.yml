@@ -1,5 +1,7 @@
 name: reviewbuddy
 description: AI code review on every pull request, posted as inline comments. Can fail the check on chosen severities.
+# Settings also come from the reviewed repo's .reviewbuddy.json and .reviewbuddy.md, read from the PR's base branch.
+# A non-empty input below overrides the same setting in .reviewbuddy.json.
 author: fernandesnaycaden-debug
 branding:
   icon: eye
@@ -10,29 +12,32 @@ inputs:
     description: Token used to read the pull request and post the review. Needs pull-requests write permission.
     default: ${{ github.token }}
   provider:
-    description: Model provider, one of groq, openrouter, gemini, anthropic (ollama only with OLLAMA_URL set).
+    description: Model provider, one of groq, openrouter, gemini, anthropic (ollama only with OLLAMA_URL set). Always overrides provider in .reviewbuddy.json.
     required: true
   model:
-    description: Model name for the chosen provider. Empty uses reviewbuddy's default for that provider.
+    description: Model name for the chosen provider. Empty uses model from .reviewbuddy.json if it names the same provider, else reviewbuddy's default.
     default: ''
   api-key:
     description: API key for the chosen provider. Pass it from a secret, e.g. secrets.GROQ_API_KEY.
     default: ''
   fail-on:
-    description: Comma-separated severities that fail the check (bug, security, performance, suggestion). Empty never fails on findings.
+    description: Comma-separated severities that fail the check (bug, security, performance, suggestion). Empty uses failOn from .reviewbuddy.json, else never fails.
     default: ''
   min-severity:
-    description: Least serious severity to report (security > bug > performance > suggestion), like --min-severity. Empty reports everything.
+    description: Least serious severity to report (security > bug > performance > suggestion), like --min-severity. Empty uses .reviewbuddy.json, else reports everything.
     default: ''
   ignore:
-    description: Extra comma-separated file patterns to skip, like --ignore.
+    description: Extra comma-separated file patterns to skip, like --ignore. Added to the defaults and to ignore in .reviewbuddy.json.
     default: ''
   full:
     description: Review the whole PR instead of only the commits since the last reviewbuddy review.
     default: 'false'
   timeout:
-    description: Seconds a single model request may take (0 = no limit). Empty uses the default.
+    description: Seconds a single model request may take (0 = no limit). Empty uses .reviewbuddy.json, else the default.
     default: ''
+  config:
+    description: Read .reviewbuddy.json and .reviewbuddy.md from the PR's base branch. 'false' ignores both, like --no-config.
+    default: 'true'
 
 runs:
   using: composite
@@ -56,6 +61,7 @@ runs:
         INPUT_IGNORE: ${{ inputs.ignore }}
         INPUT_FULL: ${{ inputs.full }}
         INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_CONFIG: ${{ inputs.config }}
       run: |
         if [ "$GITHUB_EVENT_NAME" != "pull_request" ] || [ -z "$PR_URL" ]; then
           echo "::error::reviewbuddy runs on pull_request events (this run is \"$GITHUB_EVENT_NAME\"). Trigger the workflow with on: pull_request."
@@ -83,5 +89,6 @@ runs:
 
         args=()
         if [ "$INPUT_FULL" = "true" ]; then args+=(--full); fi
+        if [ "$INPUT_CONFIG" = "false" ]; then args+=(--no-config); fi
 
         node "$GITHUB_ACTION_PATH/bin/reviewbuddy.js" "$PR_URL" "${args[@]}"

@@ -9,6 +9,7 @@ import { markerFor } from '../src/dedupe.js';
 import {
   buildReview, formatReport, main, parseFailOn, parseMinSeverity, writeReport,
 } from '../src/index.js';
+import { SYSTEM_PROMPT } from '../src/review.js';
 
 const diff = [
   'diff --git a/src/a.js b/src/a.js',
@@ -153,6 +154,9 @@ function withEnv(vars, fn) {
     REVIEWBUDDY_PROVIDER: '',
     REVIEWBUDDY_FAIL_ON: '',
     REVIEWBUDDY_MIN_SEVERITY: '',
+    REVIEWBUDDY_IGNORE: '',
+    REVIEWBUDDY_TIMEOUT: '',
+    OLLAMA_MODEL: '',
     GITHUB_ACTIONS: '',
     GITHUB_STEP_SUMMARY: '',
     GITHUB_EVENT_PATH: '',
@@ -170,6 +174,7 @@ function withEnv(vars, fn) {
 
 const PR_URL = 'https://github.com/o/r/pull/1';
 const HEAD = 'abc1234def0';
+const BASE = 'bbb2222ccc0';
 const OLD = 'aaa1111bbb0';
 const hardcodedKey = { line: 2, severity: 'security', message: 'Hardcoded key' };
 
@@ -197,16 +202,22 @@ const SOURCE = "const a = 1;\nconst key = 'secret';\nexport { a };\n";
  * Mock GitHub (PR 1 at HEAD, with the given reviews and review comments) and Ollama (replying with findings).
  * compare: the diff since the old commit, or null to answer 404. postStatus: answer the post with this error status.
  * source: src/a.js at HEAD, or null to answer 404.
- * Returns the posted review bodies, the requested URLs and the prompts sent to the model.
+ * config: { [name]: text } for .reviewbuddy.json / .reviewbuddy.md. They exist at BASE only; headConfig is what the PR's head has.
+ * Returns the posted review bodies, the requested URLs, and the user and system prompts sent to the model.
  */
 function fakeGitHub({
   reviews = [], comments = [], compare = compareDiff, findings = [hardcodedKey], postStatus, source = SOURCE,
+  config = {}, headConfig = {},
 } = {}) {
-  const calls = { posted: [], urls: [], reviewed: [] };
+  const calls = {
+    posted: [], urls: [], reviewed: [], systems: [],
+  };
   mock.method(globalThis, 'fetch', async (url, init) => {
     calls.urls.push(url);
     if (url === 'http://ollama.test/api/chat') {
-      calls.reviewed.push(JSON.parse(init.body).messages.at(-1).content);
+      const { messages } = JSON.parse(init.body);
+      calls.reviewed.push(messages.at(-1).content);
+      calls.systems.push(messages[0].content);
       return ollamaReply(findings);
     }
     const path = url.replace('https://api.github.com/repos/o/r/', '');
@@ -223,11 +234,17 @@ function fakeGitHub({
       return Response.json(reviews.slice((page - 1) * 100, page * 100));
     }
     if (path.startsWith('pulls/1/comments')) return Response.json(comments);
+    const configFile = path.match(/^contents\/(\.reviewbuddy\.(?:json|md))\?ref=(\w+)$/);
+    if (configFile) {
+      const [, name, ref] = configFile;
+      const text = (ref === BASE ? config : ref === HEAD ? headConfig : {})[name];
+      return text === undefined ? Response.json({ message: 'Not Found' }, { status: 404 }) : new Response(text);
+    }
     if (path.startsWith('contents/')) {
       return source === null ? Response.json({ message: 'Not Found' }, { status: 404 }) : new Response(source);
     }
     if (init.headers.Accept === 'application/vnd.github.diff') return new Response(diff);
-    return Response.json({ head: { sha: HEAD } });
+    return Response.json({ head: { sha: HEAD }, base: { sha: BASE, ref: 'main' } });
   });
   return calls;
 }
@@ -244,8 +261,9 @@ test('main reviews a pull request and posts the review', () => github(async () =
 
   await main([PR_URL, '--timeout', '5']);
 
-  // The PR, its reviews, its diff, the file at HEAD, the model, the post. No earlier reviews, so no compare or comments.
-  assert.equal(calls.urls.length, 6);
+  // The PR, the two config files at BASE, its reviews, its diff, the file at HEAD, the model, the post.
+  // No earlier reviews, so no compare or comments.
+  assert.equal(calls.urls.length, 8);
   assert.ok(calls.urls.includes(`https://api.github.com/repos/o/r/contents/src/a.js?ref=${HEAD}`));
   assert.equal(calls.posted.length, 1);
   assert.equal(calls.posted[0].commit_id, HEAD);
@@ -260,7 +278,8 @@ test('main stops when the head commit was already reviewed', () => github(async 
 
   assert.equal(calls.posted.length, 0);
   assert.equal(calls.reviewed.length, 0);
-  assert.equal(calls.urls.length, 2);
+  // The PR, the two config files, its reviews.
+  assert.equal(calls.urls.length, 4);
   assert.match(logged(), /Already reviewed abc1234, nothing new/);
 }));
 
@@ -453,6 +472,7 @@ test('in Actions, main writes the report to the job summary and prints annotatio
 });
 
 test('in Actions, main refuses Ollama without OLLAMA_URL', () => actions({ OLLAMA_URL: '' }, async () => {
+  fakeGitHub();
   await assert.rejects(main([PR_URL]), /Ollama doesn't run on GitHub-hosted runners/);
 }));
 
@@ -670,4 +690,116 @@ test('main drops a suggestion that is the same as the current line', () => githu
   await main([PR_URL]);
 
   assert.equal(calls.posted[0].comments[0].body, '**[SECURITY]** Hardcoded key');
+}));
+
+// Per-repository config
+
+const baseConfig = {
+  '.reviewbuddy.json': JSON.stringify({ failOn: ['security'] }),
+  '.reviewbuddy.md': '- Secrets come from process.env, never literals.',
+};
+
+test('main reads the PR\'s config from its base commit, never from its head', () => github(async () => {
+  const calls = fakeGitHub({
+    config: baseConfig,
+    headConfig: { '.reviewbuddy.json': '{"failOn": []}', '.reviewbuddy.md': 'HEAD RULES' },
+  });
+
+  await main([PR_URL]);
+
+  assert.ok(calls.urls.includes(`https://api.github.com/repos/o/r/contents/.reviewbuddy.json?ref=${BASE}`));
+  assert.ok(calls.urls.includes(`https://api.github.com/repos/o/r/contents/.reviewbuddy.md?ref=${BASE}`));
+  assert.deepEqual(calls.urls.filter((u) => u.includes('.reviewbuddy') && !u.endsWith(`ref=${BASE}`)), []);
+  // failOn and the rules from the base branch apply.
+  assert.equal(process.exitCode, 1);
+  assert.match(calls.systems[0], /=== PROJECT RULES FROM THE REPOSITORY ===[^]*- Secrets come from process\.env, never literals\.\n=== END OF PROJECT RULES ===$/);
+  assert.doesNotMatch(calls.systems[0], /HEAD RULES/);
+  assert.match(logged(), /^Config: \.reviewbuddy\.json \(base branch main @ bbb2222\), \.reviewbuddy\.md \(base branch main @ bbb2222\)$/m);
+}));
+
+test('a flag wins over the PR\'s config', () => github(async () => {
+  fakeGitHub({ config: baseConfig });
+
+  await main([PR_URL, '--fail-on', 'bug']);
+
+  assert.notEqual(process.exitCode, 1);
+}));
+
+test('an empty action input falls through to the PR\'s config', () => github(() => withEnv({ REVIEWBUDDY_FAIL_ON: '' }, async () => {
+  fakeGitHub({ config: baseConfig });
+
+  await main([PR_URL]);
+
+  assert.equal(process.exitCode, 1);
+})));
+
+test('without config files the system prompt is exactly the built-in one, and nothing is printed about config', () => github(async () => {
+  const calls = fakeGitHub();
+
+  await main([PR_URL]);
+
+  assert.equal(calls.systems[0], SYSTEM_PROMPT);
+  assert.doesNotMatch(logged(), /Config/);
+}));
+
+test('main --no-config reads neither file', () => github(async () => {
+  const calls = fakeGitHub({ config: baseConfig });
+
+  await main([PR_URL, '--no-config']);
+
+  assert.deepEqual(calls.urls.filter((u) => u.includes('.reviewbuddy')), []);
+  assert.equal(calls.systems[0], SYSTEM_PROMPT);
+  assert.notEqual(process.exitCode, 1);
+}));
+
+test('main stops on an invalid config on the base branch, naming it', () => github(async () => {
+  fakeGitHub({ config: { '.reviewbuddy.json': '{"failOn": "security"}' } });
+
+  await assert.rejects(main([PR_URL]), /"failOn" in \.reviewbuddy\.json \(base branch main @ bbb2222\) must be an array of severities/);
+}));
+
+/** A git repo in dir/repo with the given files, and a diff for its src/a.js. Returns the diff's path. */
+async function localRepo(files) {
+  const repo = join(dir, 'repo');
+  await mkdir(join(repo, '.git'), { recursive: true });
+  await mkdir(join(repo, 'src'));
+  for (const [name, text] of Object.entries(files)) await writeFile(join(repo, name), text);
+  await writeFile(join(dir, 'changes.diff'), diff);
+  return join(dir, 'changes.diff');
+}
+
+test('main reads a diff file\'s config from --repo-dir, walking up to the git root', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  const prompts = [];
+  mock.method(globalThis, 'fetch', async (url, init) => {
+    prompts.push(JSON.parse(init.body).messages[0].content);
+    return ollamaReply(mixed);
+  });
+  const diffPath = await localRepo({
+    '.reviewbuddy.json': JSON.stringify({ minSeverity: 'security', failOn: ['security'] }),
+    '.reviewbuddy.md': '- Errors are logged with logger.error, never console.log.',
+  });
+
+  await main([diffPath, '--repo-dir', join(dir, 'repo', 'src')]);
+
+  assert.match(logged(), /Left out 3 findings below --min-severity security\./);
+  assert.equal(process.exitCode, 1);
+  assert.match(prompts[0], /- Errors are logged with logger\.error, never console\.log\.\n=== END OF PROJECT RULES ===$/);
+  assert.ok(logged().includes(`Config: ${join(dir, 'repo', '.reviewbuddy.json')}, ${join(dir, 'repo', '.reviewbuddy.md')}`));
+}));
+
+test('main --no-config ignores a diff file\'s local config', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  fakeOllama(mixed);
+  const diffPath = await localRepo({ '.reviewbuddy.json': '{"minSeverity": "security"}' });
+
+  await main([diffPath, '--repo-dir', join(dir, 'repo'), '--no-config']);
+
+  assert.doesNotMatch(logged(), /Left out|Config/);
+}));
+
+test('main refuses a local config holding a secret before reviewing anything', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
+  const fetch = mock.method(globalThis, 'fetch', async () => assert.fail('nothing should be fetched'));
+  const diffPath = await localRepo({ '.reviewbuddy.json': '{"provider": "groq", "GROQ_API_KEY": "gsk_123"}' });
+
+  await assert.rejects(main([diffPath, '--repo-dir', join(dir, 'repo')]), /\.reviewbuddy\.json must not contain secrets, but it has "GROQ_API_KEY"/);
+  assert.equal(fetch.mock.callCount(), 0);
 }));

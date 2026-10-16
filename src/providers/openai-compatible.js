@@ -29,9 +29,8 @@ export function openAICompatible({
     }
   }
 
-  async function send(systemPrompt, userPrompt, schema, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  async function send(systemPrompt, userPrompt, schema, { timeoutMs = DEFAULT_TIMEOUT_MS, model = modelName() } = {}) {
     const key = checkConfig();
-    const model = modelName();
     const reply = await withSchemaFallback({ label, model }, schema, (schema) => postJson(url, {
       label, model, keyVar, modelVar, timeoutMs, hints,
       schemaSent: Boolean(schema),
@@ -52,5 +51,7 @@ export function openAICompatible({
     return reply.choices?.[0]?.message?.content ?? '';
   }
 
-  return { chat, modelName, checkConfig, DEFAULT_MODEL: defaultModel, PROMPT_CHARS: promptChars };
+  return {
+    chat, modelName, checkConfig, DEFAULT_MODEL: defaultModel, PROMPT_CHARS: promptChars, MODEL_VAR: modelVar,
+  };
 }

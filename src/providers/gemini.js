@@ -7,12 +7,13 @@ const LABEL = 'Gemini';
 export const DEFAULT_MODEL = 'gemini-3.8-flash';
 // Most user-prompt characters (diff plus file context) to send, about 20k tokens.
 export const PROMPT_CHARS = 60_000;
+export const MODEL_VAR = 'GEMINI_MODEL';
 
 const NO_COMMENTS = '{"comments":[]}';
 const BLOCKED_FINISH_REASONS = ['SAFETY', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII', 'RECITATION'];
 
 export function modelName() {
-  return process.env.GEMINI_MODEL || DEFAULT_MODEL;
+  return process.env[MODEL_VAR] || DEFAULT_MODEL;
 }
 
 export function checkConfig() {
@@ -23,13 +24,12 @@ export function checkConfig() {
  * Send a system + user prompt to Gemini and return the reply text, constrained to schema.
  * The key goes in a header rather than the URL, so it can't end up in an error message.
  */
-export async function chat(systemPrompt, userPrompt, schema, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+export async function chat(systemPrompt, userPrompt, schema, { timeoutMs = DEFAULT_TIMEOUT_MS, model = modelName() } = {}) {
   const key = checkConfig();
-  const model = modelName();
   const reply = await withSchemaFallback({ label: LABEL, model }, schema, (schema) => postJson(`${API_URL}/${model}:generateContent`, {
     label: LABEL, model, timeoutMs,
     keyVar: 'GEMINI_API_KEY',
-    modelVar: 'GEMINI_MODEL',
+    modelVar: MODEL_VAR,
     schemaSent: Boolean(schema),
     headers: { 'x-goog-api-key': key },
     body: {

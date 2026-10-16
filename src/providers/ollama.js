@@ -6,6 +6,7 @@ import { fetchWithRetry } from '../http.js';
 
 const DEFAULT_URL = 'http://localhost:11434';
 export const DEFAULT_MODEL = 'qwen3.5:4b';
+export const MODEL_VAR = 'OLLAMA_MODEL';
 export const DEFAULT_TIMEOUT_MS = 600_000;
 const NUM_CTX = 8192;
 // Most user-prompt characters (diff plus file context) to send. num_ctx is 8192 tokens at about
@@ -13,7 +14,7 @@ const NUM_CTX = 8192;
 export const PROMPT_CHARS = 16_000;
 
 export function modelName() {
-  return process.env.OLLAMA_MODEL || DEFAULT_MODEL;
+  return process.env[MODEL_VAR] || DEFAULT_MODEL;
 }
 
 /**
@@ -23,11 +24,10 @@ export function modelName() {
  *
  * The reply is streamed: Node's fetch gives up if no response headers arrive within
  * 5 minutes, and a slow model can take longer than that to finish a whole reply.
- * timeoutMs limits the whole request instead (0 = no limit).
+ * timeoutMs limits the whole request instead (0 = no limit). model defaults to modelName().
  */
-export async function chat(systemPrompt, userPrompt, schema, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+export async function chat(systemPrompt, userPrompt, schema, { timeoutMs = DEFAULT_TIMEOUT_MS, model = modelName() } = {}) {
   const baseUrl = process.env.OLLAMA_URL || DEFAULT_URL;
-  const model = modelName();
 
   try {
     const response = await fetchWithRetry(`${baseUrl}/api/chat`, {
