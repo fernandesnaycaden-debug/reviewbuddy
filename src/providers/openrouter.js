@@ -3,7 +3,9 @@
 
 import { openAICompatible } from './openai-compatible.js';
 
-export const { chat, modelName, checkConfig, DEFAULT_MODEL, PROMPT_CHARS } = openAICompatible({
+export const {
+  chat, modelName, checkConfig, DEFAULT_MODEL, PROMPT_CHARS, MODEL_VAR,
+} = openAICompatible({
   label: 'OpenRouter',
   url: 'https://openrouter.ai/api/v1/chat/completions',
   keyVar: 'OPENROUTER_API_KEY',

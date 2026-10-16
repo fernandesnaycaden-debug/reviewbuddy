@@ -2,7 +2,9 @@
 
 import { openAICompatible } from './openai-compatible.js';
 
-export const { chat, modelName, checkConfig, DEFAULT_MODEL, PROMPT_CHARS } = openAICompatible({
+export const {
+  chat, modelName, checkConfig, DEFAULT_MODEL, PROMPT_CHARS, MODEL_VAR,
+} = openAICompatible({
   label: 'Groq',
   url: 'https://api.groq.com/openai/v1/chat/completions',
   keyVar: 'GROQ_API_KEY',

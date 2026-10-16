@@ -1,0 +1,8 @@
+{
+  "provider": "groq",
+  "model": "openai/gpt-oss-120b",
+  "ignore": ["src/generated/", "*.pb.js", "fixtures/"],
+  "minSeverity": "bug",
+  "failOn": ["security", "bug"],
+  "timeout": 120
+}

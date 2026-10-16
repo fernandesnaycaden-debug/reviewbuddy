@@ -7,6 +7,7 @@ const LABEL = 'Anthropic';
 export const DEFAULT_MODEL = 'claude-opus-5-5';
 // Most user-prompt characters (diff plus file context) to send, about 20k tokens. Paid per token.
 export const PROMPT_CHARS = 60_000;
+export const MODEL_VAR = 'ANTHROPIC_MODEL';
 
 const NO_COMMENTS = '{"comments":[]}';
 // Models that can hand a declined request to another Claude model server-side.
@@ -14,7 +15,7 @@ const NO_COMMENTS = '{"comments":[]}';
 const FALLBACK_MODELS = ['claude-fable-5-1', 'claude-opus-5-5', 'claude-opus-5', 'claude-sonnet-5-5'];
 
 export function modelName() {
-  return process.env.ANTHROPIC_MODEL || DEFAULT_MODEL;
+  return process.env[MODEL_VAR] || DEFAULT_MODEL;
 }
 
 export function checkConfig() {
@@ -25,14 +26,13 @@ export function checkConfig() {
  * Send a system + user prompt to Claude and return the reply text, constrained to schema.
  * No temperature: current Claude models reject it.
  */
-export async function chat(systemPrompt, userPrompt, schema, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+export async function chat(systemPrompt, userPrompt, schema, { timeoutMs = DEFAULT_TIMEOUT_MS, model = modelName() } = {}) {
   const key = checkConfig();
-  const model = modelName();
   const fallback = FALLBACK_MODELS.includes(model);
   const reply = await withSchemaFallback({ label: LABEL, model }, schema, (schema) => postJson(API_URL, {
     label: LABEL, model, timeoutMs,
     keyVar: 'ANTHROPIC_API_KEY',
-    modelVar: 'ANTHROPIC_MODEL',
+    modelVar: MODEL_VAR,
     schemaSent: Boolean(schema),
     headers: {
       'x-api-key': key,
