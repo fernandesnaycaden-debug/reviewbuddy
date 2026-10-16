@@ -8,7 +8,10 @@ import {
 import {
   dropPosted, findingKey, latestMarkedReview, markerFor, openFindings, parseMarker, postedKeys,
 } from './dedupe.js';
-import { commentableLines, splitDiff } from './diff.js';
+import { commentableLines, decodeDiff, splitDiff } from './diff.js';
+import {
+  checkRev, GIT_MODES, gitDiff, gitShow,
+} from './git.js';
 import {
   getCompareDiff, getFileContent, getPullRequest, getPullRequestDiff, listReviewComments, listReviews, parsePrUrl, postReview,
 } from './github.js';
@@ -16,6 +19,8 @@ import {
   findLocalConfig, loadConfig, loadRemoteConfig, resolveSettings,
 } from './config.js';
 import { isIgnored } from './ignore.js';
+import { info, logToStderr } from './log.js';
+import { formatJson, formatSarif, outputFormat } from './output.js';
 import { describe as describeProvider, useProvider } from './providers/index.js';
 import { atLeast, reviewDiff } from './review.js';
 
@@ -25,11 +30,22 @@ export { parseFailOn, parseMinSeverity } from './config.js';
 
 /** Run the CLI with the given arguments (process.argv without node and the script). */
 export async function main(argv) {
+  try {
+    await run(argv);
+  } finally {
+    // Tests call main again in the same process.
+    logToStderr(false);
+  }
+}
+
+async function run(argv) {
   const { values: flags, positionals } = parseArgs({
     args: argv,
     options: {
+      branch: { type: 'string' },
       'dry-run': { type: 'boolean', default: false },
       'fail-on': { type: 'string' },
+      format: { type: 'string' },
       full: { type: 'boolean', default: false },
       ignore: { type: 'string' },
       'min-severity': { type: 'string' },
@@ -38,13 +54,16 @@ export async function main(argv) {
       output: { type: 'string', short: 'o' },
       provider: { type: 'string' },
       'repo-dir': { type: 'string' },
+      since: { type: 'string' },
+      staged: { type: 'boolean' },
       timeout: { type: 'string' },
+      uncommitted: { type: 'boolean' },
     },
     allowPositionals: true,
   });
 
-  const target = positionals[0] || SAMPLE_DIFF;
-  const pr = parsePrUrl(target);
+  const input = selectInput(flags, positionals);
+  const { pr } = input;
   const repoDir = flags['repo-dir'];
   if (repoDir !== undefined && !(await stat(repoDir).catch(() => null))?.isDirectory()) {
     throw new Error(`--repo-dir ${repoDir} is not a directory.`);
@@ -53,6 +72,7 @@ export async function main(argv) {
   // Check flags and variables now, before any request. A provider they name wins over the
   // repo's config, so an unknown one or a missing API key fails here too.
   const early = resolveSettings({ flags, env: process.env });
+  routeLogs(early.format, flags.output);
   if (early.providerSource !== 'default' && await selectProvider(early.provider) === SKIPPED) return;
 
   const token = process.env.GITHUB_TOKEN;
@@ -65,32 +85,64 @@ export async function main(argv) {
     details = await getPullRequest(pr, token);
   }
   const config = await repoConfig(flags['no-config'], pr, token, details, repoDir);
-  if (config.summary) console.log(config.summary);
-
   const settings = resolveSettings({ flags, env: process.env, file: config.file });
+  // The repo's config can set the format too.
+  routeLogs(settings.format, flags.output);
+  if (config.summary) info(config.summary);
+
   const { failOn, minSeverity } = settings;
+  const format = outputFormat(settings.format, flags.output);
   const unreachable = failOn.filter((s) => !atLeast(s, minSeverity));
   if (unreachable.length > 0) {
     console.warn(`Warning: --fail-on ${unreachable.join(',')} has no effect with --min-severity ${minSeverity}, which leaves those findings out.`);
   }
   const used = await selectProvider(settings.provider, settings.model);
   if (used === SKIPPED) return;
-  console.log(`Using ${used.provider} (${used.model})\n`);
+  info(`Using ${used.provider} (${used.model})\n`);
 
   const options = {
     dryRun: flags['dry-run'],
     failOn,
     full: flags.full,
     minSeverity,
-    output: flags.output,
     repoDir,
     timeoutMs: settings.timeoutMs,
     ignorePatterns: settings.ignorePatterns,
     rules: config.rules,
   };
 
-  const findings = pr ? await reviewPullRequest(pr, token, details, options) : await reviewDiffFile(target, options);
+  const { results, findings, seconds } = pr
+    ? await reviewPullRequest(pr, token, details, options)
+    : await reviewLocal(input, options);
+  await writeOutput(results, { format, output: flags.output, seconds });
   checkFailOn(findings, failOn);
+}
+
+const ONE_INPUT = 'Review one thing at a time: pass only one of --staged, --uncommitted, --branch <base>, --since <rev>, a diff file, a PR URL or - (stdin).';
+
+/**
+ * What to review, from the git flags and the positional target:
+ * { kind: 'git', mode, rev }, { kind: 'stdin' }, { kind: 'pr', pr } or { kind: 'file', path }.
+ * Without any, the sample diff.
+ */
+export function selectInput(flags, positionals) {
+  const modes = Object.keys(GIT_MODES).filter((m) => flags[m] !== undefined && flags[m] !== false);
+  if (positionals.length > 1 || modes.length + positionals.length > 1) throw new Error(ONE_INPUT);
+  if (modes.length === 1) {
+    const [mode] = modes;
+    if (!GIT_MODES[mode].takesRev) return { kind: 'git', mode };
+    checkRev(flags[mode], GIT_MODES[mode].flag);
+    return { kind: 'git', mode, rev: flags[mode] };
+  }
+  const target = positionals[0] || SAMPLE_DIFF;
+  if (target === '-') return { kind: 'stdin' };
+  const pr = parsePrUrl(target);
+  return pr ? { kind: 'pr', pr } : { kind: 'file', path: target };
+}
+
+/** Send progress to stderr when a JSON or SARIF document goes to stdout, so stdout holds only that. */
+function routeLogs(format, output) {
+  logToStderr(!output && (format === 'json' || format === 'sarif'));
 }
 
 const SKIPPED = Symbol('skipped');
@@ -133,7 +185,7 @@ function checkFailOn(findings, failOn) {
     .filter((f) => failOn.includes(f.severity))
     .map((f) => findingKey(f.filename, f.line, f.severity)));
   if (failing.size === 0) return;
-  console.log(`\nFailing: ${plural(failing.size, 'finding')} match --fail-on ${failOn.join(',')}.`);
+  info(`\nFailing: ${plural(failing.size, 'finding')} match --fail-on ${failOn.join(',')}.`);
   process.exitCode = 1;
 }
 
@@ -158,23 +210,63 @@ function flatFindings(results) {
   return results.flatMap((r) => r.comments.map((c) => ({ filename: r.filename, line: c.line, severity: c.severity })));
 }
 
-/** Review a diff file and return its findings, for --fail-on. */
-async function reviewDiffFile(diffPath, options) {
-  const files = reviewable(splitDiff(await readFile(diffPath, 'utf8')), options);
+/**
+ * Review a diff file, stdin or local git changes (input: see selectInput).
+ * Returns { results, findings (for --fail-on), seconds }.
+ */
+async function reviewLocal(input, options) {
+  const { text, label, loadSource } = await localInput(input, options.repoDir);
+  const files = reviewable(splitDiff(text), options);
   if (files.length === 0) {
-    console.log(`Nothing to review in ${diffPath}.`);
-    await appendStepSummary(`reviewbuddy: nothing to review in ${diffPath}.`);
-    return [];
+    info(`Nothing to review in ${label}.`);
+    await appendStepSummary(`reviewbuddy: nothing to review in ${label}.`);
+    return { results: [], findings: [], seconds: '0.0' };
   }
-  return flatFindings(await reviewFiles(files, options, localSource(options.repoDir)));
+  const { results, seconds } = await reviewFiles(files, options, loadSource);
+  return { results, findings: flatFindings(results), seconds };
 }
 
 /**
- * Read a changed file from the local checkout (repoDir, else the current directory) for context.
+ * The diff to review, a label for it, and where to read changed files for context.
+ * Git modes read each file's version from the same place the diff's new side comes from
+ * (the index for --staged, HEAD for --branch and --since, the working tree for --uncommitted),
+ * relative to the repo's top level. Diff files and stdin read the working tree under repoDir.
+ */
+async function localInput(input, repoDir) {
+  if (input.kind === 'git') {
+    const {
+      diff, root, label, spec,
+    } = await gitDiff(input, repoDir ?? '.');
+    info(`Reviewing ${label} in ${root}\n`);
+    const read = spec ? (path, filename) => gitShow(root, spec, filename) : undefined;
+    return { text: diff, label, loadSource: localSource(root, read) };
+  }
+  if (input.kind === 'stdin') return { text: await readStdin(), label: 'stdin', loadSource: localSource(repoDir) };
+  return { text: decodeDiff(await readFile(input.path)), label: input.path, loadSource: localSource(repoDir) };
+}
+
+/** A diff piped in on stdin (a "-" target), decoded like a diff file. */
+export async function readStdin(stream = process.stdin) {
+  if (stream.isTTY) {
+    throw new Error('No diff on stdin. Pipe one in, like `git diff | reviewbuddy -`, or use --staged or --uncommitted instead of -.');
+  }
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+  return decodeDiff(Buffer.concat(chunks));
+}
+
+/** A file's text from the working tree, for context. */
+function readWorkingTree(path) {
+  return readFile(path, 'utf8');
+}
+
+/**
+ * Read a changed file locally (under repoDir, else the current directory) for context:
+ * read(path, filename) gives its text, from the working tree unless git says otherwise.
  * null if it isn't there, or if its path leads outside that directory: a crafted diff must not
  * get other local files sent to the model.
  */
-function localSource(repoDir = '.') {
+function localSource(repoDir = '.', read = readWorkingTree) {
   const root = resolve(repoDir);
   return async (filename) => {
     const path = resolve(root, filename);
@@ -184,7 +276,7 @@ function localSource(repoDir = '.') {
       return null;
     }
     try {
-      return await readFile(path, 'utf8');
+      return await read(path, filename);
     } catch (err) {
       if (err.code !== 'ENOENT') console.warn(`  Could not read ${filename} for context (${err.message}), reviewing the diff alone.`);
       return null;
@@ -206,8 +298,9 @@ function remoteSource(pr, token, sha) {
 }
 
 /**
- * Review a PR (details: its getPullRequest reply) and post the new findings. Returns what --fail-on judges:
- * this run's findings, including ones posted before, plus earlier inline findings whose lines haven't changed since.
+ * Review a PR (details: its getPullRequest reply) and post the new findings. Returns { results, findings, seconds }:
+ * results are this run's findings, including ones posted before (for --output and --format). findings are what
+ * --fail-on judges: those, plus earlier inline findings whose lines haven't changed since.
  */
 async function reviewPullRequest(pr, token, { head }, options) {
   const reviews = await listReviews(pr, token);
@@ -221,9 +314,9 @@ async function reviewPullRequest(pr, token, { head }, options) {
 
   const previous = options.full ? null : latestMarkedReview(reviews);
   if (previous?.sha === head.sha) {
-    console.log(`Already reviewed ${short(head.sha)}, nothing new`);
+    info(`Already reviewed ${short(head.sha)}, nothing new`);
     await appendStepSummary(`reviewbuddy already reviewed \`${short(head.sha)}\`, nothing new.`);
-    return stillOpen();
+    return { results: [], findings: await stillOpen(), seconds: '0.0' };
   }
 
   const prFiles = reviewable(splitDiff(await getPullRequestDiff(pr, token)), options);
@@ -234,24 +327,29 @@ async function reviewPullRequest(pr, token, { head }, options) {
     if (newer) {
       files = newer;
       since = short(previous.sha);
-      console.log(`Reviewing changes since ${since}`);
+      info(`Reviewing changes since ${since}`);
     } else {
-      console.log(`Previous review's commit ${short(previous.sha)} no longer exists (force-push or rebase?), reviewing the whole PR.`);
+      info(`Previous review's commit ${short(previous.sha)} no longer exists (force-push or rebase?), reviewing the whole PR.`);
     }
   }
-  console.log(`Pull request ${pr.owner}/${pr.repo}#${pr.number}: ${files.length} file(s) to review\n`);
+  info(`Pull request ${pr.owner}/${pr.repo}#${pr.number}: ${files.length} file(s) to review\n`);
 
-  let results = files.length > 0 ? await reviewFiles(files, options, remoteSource(pr, token, head.sha)) : [];
+  const reviewed = files.length > 0
+    ? await reviewFiles(files, options, remoteSource(pr, token, head.sha))
+    : { results: [], seconds: '0.0' };
+  let { results } = reviewed;
   // Judged before dropping repeats: a finding posted earlier is still in the code.
   const findings = [...flatFindings(results), ...await stillOpen()];
+  // --output and --format get every finding of this run, posted before or not.
+  const done = { results: reviewed.results, findings, seconds: reviewed.seconds };
   if (ourReviews.size > 0 && countIssues(results) > 0) {
     const dropped = dropPosted(results, postedKeys(await listOurComments(), ourReviews));
     results = dropped.results;
-    console.log(`Skipped ${plural(dropped.skipped, 'finding')} already posted in an earlier review.`);
+    info(`Skipped ${plural(dropped.skipped, 'finding')} already posted in an earlier review.`);
   }
   if (countIssues(results) === 0) {
-    console.log('No new findings to post.');
-    return findings;
+    info('No new findings to post.');
+    return done;
   }
 
   // GitHub only accepts inline comments on lines in the PR's own diff, not the compare diff.
@@ -262,9 +360,9 @@ async function reviewPullRequest(pr, token, { head }, options) {
   );
 
   if (options.dryRun) {
-    console.log('Dry run, not posting. The review would be:\n');
-    console.log(JSON.stringify(review, null, 2));
-    return findings;
+    info('Dry run, not posting. The review would be:\n');
+    info(JSON.stringify(review, null, 2));
+    return done;
   }
   let posted;
   try {
@@ -273,10 +371,10 @@ async function reviewPullRequest(pr, token, { head }, options) {
     // On a fork PR the workflow's token is read-only; the annotations and job summary still have the findings.
     if (err.status !== 403 || !inActions() || !await isForkPullRequest()) throw err;
     warning('Could not post the review: on pull requests from forks the GitHub token is read-only. The findings are in the job summary and the annotations.');
-    return findings;
+    return done;
   }
-  console.log(`Posted review: ${posted.html_url}`);
-  return findings;
+  info(`Posted review: ${posted.html_url}`);
+  return done;
 }
 
 /**
@@ -331,7 +429,7 @@ function reviewable(files, { ignorePatterns }) {
   const kept = files.filter((f) => !isIgnored(f.filename, ignorePatterns));
   const skipped = files.filter((f) => !kept.includes(f));
   if (skipped.length > 0) {
-    console.log(`Skipping ${plural(skipped.length, 'ignored file')}: ${skipped.map((f) => f.filename).join(', ')}\n`);
+    info(`Skipping ${plural(skipped.length, 'ignored file')}: ${skipped.map((f) => f.filename).join(', ')}\n`);
   }
   return kept;
 }
@@ -350,19 +448,19 @@ function reviewBody(results, leftovers, { since, model, provider }) {
 }
 
 /**
- * Review each file, print the findings, and return [{ filename, diff, comments }].
+ * Review each file, print the findings, and return { results: [{ filename, diff, comments }], seconds }.
  * loadSource(filename) gives the file's new version for context, or null.
- * Findings below minSeverity are left out here, so nothing later sees them.
+ * Findings below minSeverity are left out here, so nothing later sees them: not --fail-on, and not any output format.
  */
 async function reviewFiles(files, {
-  output, timeoutMs, minSeverity, rules,
+  timeoutMs, minSeverity, rules,
 }, loadSource) {
   const start = performance.now();
   const results = [];
   let below = 0;
 
   for (const [i, file] of files.entries()) {
-    console.log(`Reviewing ${file.filename} (${i + 1}/${files.length}) ...`);
+    info(`Reviewing ${file.filename} (${i + 1}/${files.length}) ...`);
     const source = await loadSource(file.filename);
     const found = await reviewDiff(file.filename, file.diff, { timeoutMs, source, rules });
     const comments = found.filter((c) => atLeast(c.severity, minSeverity));
@@ -370,27 +468,47 @@ async function reviewFiles(files, {
     results.push({ ...file, comments });
 
     for (const c of comments) {
-      console.log(`  ${file.filename}:${c.line} [${c.severity.toUpperCase()}] ${c.message}`);
-      if (c.suggestion) console.log(`    fix: ${c.suggestion.trim()}`);
+      info(`  ${file.filename}:${c.line} [${c.severity.toUpperCase()}] ${c.message}`);
+      if (c.suggestion) info(`    fix: ${c.suggestion.trim()}`);
     }
-    if (comments.length === 0) console.log('  No issues found.');
-    console.log();
+    if (comments.length === 0) info('  No issues found.');
+    info();
   }
 
   const seconds = ((performance.now() - start) / 1000).toFixed(1);
-  console.log(`${plural(countIssues(results), 'issue')} in ${plural(files.length, 'file')}. Review took ${seconds}s`);
-  if (below > 0) console.log(`Left out ${plural(below, 'finding')} below --min-severity ${minSeverity}.`);
+  info(`${plural(countIssues(results), 'issue')} in ${plural(files.length, 'file')}. Review took ${seconds}s`);
+  if (below > 0) info(`Left out ${plural(below, 'finding')} below --min-severity ${minSeverity}.`);
 
-  if (output) {
-    const filePath = await writeReport(results, { seconds, outputPath: output });
-    console.log(`\nReport written to ${filePath}`);
-  }
   if (inActions()) {
     // Annotations show on the run page and in the PR's "Files changed" view; the report goes in the job summary.
-    for (const line of annotationsFor(results)) console.log(line);
+    for (const line of annotationsFor(results)) info(line);
     await appendStepSummary(formatReport(results, { ...describeProvider(), seconds, date: new Date() }));
   }
-  return results;
+  return { results, seconds };
+}
+
+/**
+ * Write the results in format (see outputFormat): to the output file if there is one, else a JSON or
+ * SARIF document to stdout (text was already printed). Called once per run, also when nothing was reviewed,
+ * so a consumer always gets a document.
+ */
+async function writeOutput(results, { format, output, seconds }) {
+  if (format === 'text') {
+    if (!output) return;
+    const filePath = await writeReport(results, { seconds, outputPath: output });
+    info(`\nReport written to ${filePath}`);
+    return;
+  }
+  const used = describeProvider();
+  const doc = format === 'json' ? formatJson(results, { ...used, seconds }) : formatSarif(results, used);
+  const text = `${JSON.stringify(doc, null, 2)}\n`;
+  if (!output) {
+    process.stdout.write(text);
+    return;
+  }
+  const filePath = resolve(output);
+  await writeFile(filePath, text, 'utf8');
+  info(`\n${format === 'json' ? 'JSON' : 'SARIF'} written to ${filePath}`);
 }
 
 function countIssues(results) {

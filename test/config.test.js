@@ -100,7 +100,13 @@ test('parseConfig refuses anything that looks like a secret, and says where secr
 
 test('parseConfig warns about unknown keys and still uses the rest', () => {
   assert.deepEqual(parseConfig('{"minSeverity": "bug", "severity": "bug"}'), { minSeverity: 'bug' });
-  assert.match(warned(), /Warning: unknown key "severity" in \.reviewbuddy\.json, ignoring it\. Known keys: provider, model, ignore, defaultIgnore, minSeverity, failOn, timeout\./);
+  assert.match(warned(), /Warning: unknown key "severity" in \.reviewbuddy\.json, ignoring it\. Known keys: provider, model, ignore, defaultIgnore, minSeverity, failOn, timeout, format\./);
+});
+
+test('parseConfig reads "format" in any case and rejects unknown ones', () => {
+  assert.deepEqual(parseConfig('{"format": "SARIF"}'), { format: 'sarif' });
+  assert.throws(() => parseConfig('{"format": "xml"}'), /"format" in \.reviewbuddy\.json must be one of: text, json, sarif\./);
+  assert.throws(() => parseConfig('{"format": 1}'), /"format" in \.reviewbuddy\.json must be one of/);
 });
 
 // .reviewbuddy.md
@@ -143,9 +149,20 @@ test('resolveSettings uses the built-in defaults when nothing is set', () => {
     failOn: [],
     minSeverity: undefined,
     timeoutMs: undefined,
+    format: undefined,
     defaultIgnore: true,
     ignorePatterns: DEFAULT_IGNORE,
   });
+});
+
+test('resolveSettings takes the format from a flag, then a variable, then the file', () => {
+  const fromFile = { format: 'json' };
+  assert.equal(resolveSettings({ file: fromFile }).format, 'json');
+  assert.equal(resolveSettings({ env: { REVIEWBUDDY_FORMAT: 'Sarif' }, file: fromFile }).format, 'sarif');
+  assert.equal(resolveSettings({ flags: { format: 'text' }, env: { REVIEWBUDDY_FORMAT: 'sarif' }, file: fromFile }).format, 'text');
+  assert.equal(resolveSettings({ env: { REVIEWBUDDY_FORMAT: '' }, file: fromFile }).format, 'json');
+  assert.throws(() => resolveSettings({ env: { REVIEWBUDDY_FORMAT: 'xml' } }), /Unknown format "xml" in REVIEWBUDDY_FORMAT\. Use one of: text, json, sarif\./);
+  assert.throws(() => resolveSettings({ flags: { format: 'md' } }), /Unknown format "md" in --format\./);
 });
 
 test('resolveSettings takes each setting from the file over the defaults', () => {
