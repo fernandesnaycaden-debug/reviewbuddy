@@ -161,6 +161,9 @@ function withEnv(vars, fn) {
     REVIEWBUDDY_IGNORE: '',
     REVIEWBUDDY_TIMEOUT: '',
     REVIEWBUDDY_FORMAT: '',
+    REVIEWBUDDY_CONCURRENCY: '',
+    REVIEWBUDDY_MAX_FILES: '',
+    REVIEWBUDDY_MAX_CHUNKS_PER_FILE: '',
     OLLAMA_MODEL: '',
     GITHUB_ACTIONS: '',
     GITHUB_STEP_SUMMARY: '',
@@ -208,11 +211,16 @@ const SOURCE = "const a = 1;\nconst key = 'secret';\nexport { a };\n";
  * compare: the diff since the old commit, or null to answer 404. postStatus: answer the post with this error status.
  * source: src/a.js at HEAD, or null to answer 404.
  * config: { [name]: text } for .reviewbuddy.json / .reviewbuddy.md. They exist at BASE only; headConfig is what the PR's head has.
+ * Large PRs: diffStatus answers the PR's diff with that error status (406: too large), prFiles is what the files API
+ * lists, changedFiles the PR's changed_files count. compareStatus and compareFiles do the same for the compare API.
+ * findings may be a function of the reviewed file's name. ollamaStatus(filename) answers that file's model request
+ * with an error status instead; delay(filename) holds its reply back that many ms.
  * Returns the posted review bodies, the requested URLs, and the user and system prompts sent to the model.
  */
 function fakeGitHub({
   reviews = [], comments = [], compare = compareDiff, findings = [hardcodedKey], postStatus, source = SOURCE,
-  config = {}, headConfig = {},
+  config = {}, headConfig = {}, diffStatus, prFiles = [], changedFiles, compareStatus, compareFiles = [],
+  ollamaStatus = () => undefined, delay = () => 0,
 } = {}) {
   const calls = {
     posted: [], urls: [], reviewed: [], systems: [],
@@ -221,9 +229,13 @@ function fakeGitHub({
     calls.urls.push(url);
     if (url === 'http://ollama.test/api/chat') {
       const { messages } = JSON.parse(init.body);
+      const filename = messages.at(-1).content.match(/^File: (.+)$/m)[1];
       calls.reviewed.push(messages.at(-1).content);
       calls.systems.push(messages[0].content);
-      return ollamaReply(findings);
+      await new Promise((resolve) => setTimeout(resolve, delay(filename)));
+      const status = ollamaStatus(filename);
+      if (status) return new Response(`model error for ${filename}`, { status });
+      return ollamaReply(typeof findings === 'function' ? findings(filename) : findings);
     }
     const path = url.replace('https://api.github.com/repos/o/r/', '');
     if (init.method === 'POST') {
@@ -231,7 +243,15 @@ function fakeGitHub({
       calls.posted.push(JSON.parse(init.body));
       return Response.json({ html_url: 'https://github.com/o/r/pull/1#review' });
     }
+    if (path.startsWith('pulls/1/files')) {
+      const page = Number(new URL(url).searchParams.get('page'));
+      return Response.json(prFiles.slice((page - 1) * 100, page * 100));
+    }
+    if (path.startsWith('compare/') && init.headers.Accept !== 'application/vnd.github.diff') {
+      return Response.json({ commits: [{}], files: compareFiles });
+    }
     if (path.startsWith('compare/')) {
+      if (compareStatus) return Response.json({ message: 'too large' }, { status: compareStatus });
       return compare === null ? Response.json({ message: 'Not Found' }, { status: 404 }) : new Response(compare);
     }
     if (path.startsWith('pulls/1/reviews')) {
@@ -248,8 +268,11 @@ function fakeGitHub({
     if (path.startsWith('contents/')) {
       return source === null ? Response.json({ message: 'Not Found' }, { status: 404 }) : new Response(source);
     }
-    if (init.headers.Accept === 'application/vnd.github.diff') return new Response(diff);
-    return Response.json({ head: { sha: HEAD }, base: { sha: BASE, ref: 'main' } });
+    if (init.headers.Accept === 'application/vnd.github.diff') {
+      if (diffStatus) return Response.json({ message: 'Sorry, the diff exceeded the maximum number of files (300).' }, { status: diffStatus });
+      return new Response(diff);
+    }
+    return Response.json({ head: { sha: HEAD }, base: { sha: BASE, ref: 'main' }, changed_files: changedFiles ?? prFiles.length });
   });
   return calls;
 }
@@ -954,7 +977,7 @@ for (const format of ['json', 'sarif']) {
       if (format === 'json') assert.equal(doc.files[0].findings[0].message, 'Hardcoded key');
       else assert.equal(doc.runs[0].results[0].message.text, 'Hardcoded key');
       assert.match(stderr, /Using ollama/);
-      assert.match(stderr, /Reviewing src\/a\.js \(1\/1\)/);
+      assert.match(stderr, /Reviewed src\/a\.js \(1\/1\)/);
       assert.match(stderr, /Failing: 1 finding match --fail-on security/);
       // --fail-on still sets the exit code.
       assert.equal(code, 1);
@@ -963,3 +986,215 @@ for (const format of ['json', 'sarif']) {
     }
   });
 }
+
+// Large pull requests
+
+/** A files API entry adding n lines (each "const x<i> = <i>;") to a new file. */
+function apiFile(filename, n = 1) {
+  const lines = Array.from({ length: n }, (_, i) => `+const x${i} = ${i};`);
+  return {
+    filename, status: 'added', additions: n, patch: [`@@ -0,0 +1,${n} @@`, ...lines].join('\n'),
+  };
+}
+
+/** The files API entry for src/a.js matching the PR's diff above. */
+const aJsEntry = {
+  filename: 'src/a.js', status: 'modified', additions: 1, patch: diff.slice(diff.indexOf('@@')),
+};
+
+test('main falls back to the files API, page by page, when GitHub won\'t send the diff', () => github(async () => {
+  const binaries = Array.from({ length: 98 }, (_, i) => ({ filename: `img/${i}.png`, status: 'added', additions: 0 }));
+  const calls = fakeGitHub({
+    diffStatus: 406,
+    prFiles: [
+      ...binaries,
+      { filename: 'src/huge.js', status: 'modified', additions: 50_000 },
+      { filename: 'package-lock.json', status: 'modified', additions: 9000 },
+      aJsEntry,
+    ],
+  });
+
+  await main([PR_URL]);
+
+  assert.ok(calls.urls.includes('https://api.github.com/repos/o/r/pulls/1/files?per_page=100&page=1'));
+  assert.ok(calls.urls.includes('https://api.github.com/repos/o/r/pulls/1/files?per_page=100&page=2'));
+  assert.match(logged(), /too large for GitHub's diff format, reading the changed files page by page instead/);
+  // The same file and line numbers as from the diff.
+  assert.equal(calls.reviewed.length, 1);
+  assert.deepEqual(calls.posted[0].comments, [{ path: 'src/a.js', line: 2, body: '**[SECURITY]** Hardcoded key', side: 'RIGHT' }]);
+  // A file GitHub sent no patch for is listed; an ignored one isn't, and neither are binary files.
+  assert.match(calls.posted[0].body, /Not reviewed:\n- `src\/huge\.js`: too large for the GitHub API/);
+  assert.doesNotMatch(calls.posted[0].body, /package-lock|\.png/);
+  assert.ok(calls.posted[0].body.endsWith(markerFor(HEAD)));
+  assert.equal(process.exitCode, exitCode);
+}));
+
+test('main says when a PR has more files than GitHub\'s files API lists', () => github(async () => {
+  const calls = fakeGitHub({ diffStatus: 406, prFiles: [aJsEntry], changedFiles: 3002 });
+
+  await main([PR_URL]);
+
+  assert.match(warned(), /GitHub's files API lists at most 3000 files, so 3001 more changed files could not be reviewed\./);
+  assert.match(calls.posted[0].body, /Not reviewed:\n- GitHub's files API lists at most 3000 files/);
+}));
+
+test('an incremental review falls back to the compare API\'s file list when the compare diff is too large', () => github(async () => {
+  const aSince = compareDiff.slice(compareDiff.indexOf('@@'), compareDiff.indexOf('diff --git a/src/base.js'));
+  const calls = fakeGitHub({
+    reviews: [{ id: 1, body: markerFor(OLD) }],
+    compareStatus: 406,
+    compareFiles: [{
+      filename: 'src/a.js', status: 'modified', additions: 1, patch: aSince,
+    }, apiFile('src/base.js')],
+  });
+
+  await main([PR_URL]);
+
+  assert.ok(calls.urls.includes(`https://api.github.com/repos/o/r/compare/${OLD}...${HEAD}?per_page=1`));
+  // Only src/a.js: src/base.js isn't part of the PR.
+  assert.equal(calls.reviewed.length, 1);
+  assert.match(calls.reviewed[0], /const key = 'x'/);
+  assert.match(logged(), /The changes since aaa1111 are too large for GitHub's diff format, reading the changed files instead\./);
+  assert.match(calls.posted[0].body, /^reviewbuddy found 1 issue in 1 file since `aaa1111`/);
+}));
+
+test('an incremental review over the compare API\'s 300-file cap reviews the whole PR instead', () => github(async () => {
+  const calls = fakeGitHub({
+    reviews: [{ id: 1, body: markerFor(OLD) }],
+    compareStatus: 406,
+    compareFiles: Array.from({ length: 300 }, (_, i) => apiFile(`src/f${i}.js`)),
+  });
+
+  await main([PR_URL]);
+
+  assert.match(logged(), /Too many changes since aaa1111 for GitHub's compare API \(it lists at most 300 files\), reviewing the whole PR\./);
+  assert.equal(calls.reviewed.length, 1);
+  assert.doesNotMatch(calls.reviewed[0], /const key = 'x'/);
+  assert.match(calls.posted[0].body, /^reviewbuddy found 1 issue in 1 file \(/);
+}));
+
+/** Files a.js to d.js under src/, each adding one line that gets one finding. */
+const fourFiles = ['a', 'b', 'c', 'd'].map((n) => apiFile(`src/${n}.js`));
+const findingIn = (filename) => [{ line: 1, severity: 'bug', message: `Bug in ${filename}` }];
+
+test('main reviews files in parallel, printing each as one block, and keeps every output in the PR\'s order', () => github(async () => {
+  // a.js finishes last, b.js first.
+  const delays = {
+    'src/a.js': 60, 'src/b.js': 0, 'src/c.js': 30, 'src/d.js': 15,
+  };
+  const calls = fakeGitHub({
+    diffStatus: 406, prFiles: fourFiles, findings: findingIn, source: null, delay: (f) => delays[f],
+  });
+  const output = join(dir, 'out.json');
+
+  await main([PR_URL, '--concurrency', '4', '--output', output]);
+
+  const out = logged();
+  assert.match(out, /Reviewing 4 files with concurrency 4/);
+  // Blocks come in finishing order, each with the running count, and each file's lines stay together.
+  const blocks = [...out.matchAll(/Reviewed (\S+) \((\d)\/4\)\n {2}\1:1 \[BUG\] Bug in \1/g)].map((m) => `${m[2]} ${m[1]}`);
+  assert.deepEqual(blocks, ['1 src/b.js', '2 src/d.js', '3 src/c.js', '4 src/a.js']);
+  // The posted review and the JSON keep the PR's order.
+  assert.deepEqual(calls.posted[0].comments.map((c) => c.path), ['src/a.js', 'src/b.js', 'src/c.js', 'src/d.js']);
+  const doc = JSON.parse(await readFile(output, 'utf8'));
+  assert.deepEqual(doc.files.map((f) => f.path), ['src/a.js', 'src/b.js', 'src/c.js', 'src/d.js']);
+}));
+
+test('main --concurrency takes REVIEWBUDDY_CONCURRENCY and defaults to 1 for Ollama', () => github(async () => {
+  fakeGitHub({ diffStatus: 406, prFiles: fourFiles, source: null });
+  await main([PR_URL, '--dry-run']);
+  assert.match(logged(), /Reviewing 4 files with concurrency 1\n/);
+
+  await withEnv({ REVIEWBUDDY_CONCURRENCY: '3' }, () => main([PR_URL, '--dry-run']));
+  assert.match(logged(), /Reviewing 4 files with concurrency 3\n/);
+
+  await assert.rejects(main([PR_URL, '--concurrency', '0']), /Invalid value "0" in --concurrency: give a whole number from 1 to 16\./);
+}));
+
+test('a file that fails doesn\'t lose the others: they are posted, it is listed, and the run exits with 1', () => github(async () => {
+  const calls = fakeGitHub({
+    diffStatus: 406, prFiles: fourFiles, findings: findingIn, source: null, ollamaStatus: (f) => (f === 'src/b.js' ? 400 : undefined),
+  });
+
+  await main([PR_URL, '--concurrency', '2']);
+
+  assert.deepEqual(calls.posted[0].comments.map((c) => c.path), ['src/a.js', 'src/c.js', 'src/d.js']);
+  assert.match(calls.posted[0].body, /^reviewbuddy found 3 issues in 3 files/);
+  assert.match(calls.posted[0].body, /- `src\/b\.js`: failed: Ollama returned HTTP 400: model error for src\/b\.js/);
+  // The marker keeps the base commit, so the next run tries src/b.js again; posted findings are skipped then.
+  assert.ok(calls.posted[0].body.endsWith(markerFor(BASE)));
+  assert.match(logged(), /Could not review src\/b\.js \(\d\/4\)/);
+  assert.match(logged(), /Incomplete: 1 file could not be reviewed \(src\/b\.js\)\./);
+  assert.equal(process.exitCode, 1);
+}));
+
+test('an error that would fail every file stops the run instead of trying them all', () => github(async () => {
+  const calls = fakeGitHub({
+    diffStatus: 406, prFiles: [...fourFiles, apiFile('src/e.js'), apiFile('src/f.js')], source: null, ollamaStatus: () => 404,
+  });
+
+  await assert.rejects(main([PR_URL, '--concurrency', '2']), /Ollama returned HTTP 404 \(model "qwen3\.5:4b" isn't installed/);
+
+  // The two started together; nothing after them was tried, and nothing was posted.
+  assert.equal(calls.reviewed.length, 2);
+  assert.equal(calls.posted.length, 0);
+}));
+
+test('main --max-files reviews source files and the biggest changes first, and lists the rest', () => github(async () => {
+  const calls = fakeGitHub({
+    diffStatus: 406,
+    source: null,
+    findings: findingIn,
+    prFiles: [apiFile('README.md', 90), apiFile('src/small.js', 1), apiFile('test/a.test.js', 50), apiFile('src/big.js', 20), apiFile('src/mid.js', 5)],
+  });
+
+  await main([PR_URL, '--max-files', '2']);
+
+  assert.match(logged(), /Reviewing 2 of 5 files \(--max-files 2\): source files and the biggest changes first\./);
+  assert.deepEqual(calls.posted[0].comments.map((c) => c.path), ['src/big.js', 'src/mid.js']);
+  assert.match(calls.posted[0].body, /Not reviewed:\n- `README\.md`: over --max-files 2\n- `src\/small\.js`: over --max-files 2\n- `test\/a\.test\.js`: over --max-files 2/);
+  // Skipping files on purpose is not a failure.
+  assert.equal(process.exitCode, exitCode);
+  assert.ok(calls.posted[0].body.endsWith(markerFor(HEAD)));
+}));
+
+test('a review with more findings than the inline cap posts the most severe inline and lists the rest', () => github(async () => {
+  const findings = Array.from({ length: 60 }, (_, i) => ({ line: i + 1, severity: i === 59 ? 'security' : 'suggestion', message: `Finding ${i + 1}` }));
+  const calls = fakeGitHub({
+    diffStatus: 406, prFiles: [apiFile('src/gen.js', 60)], source: null, findings,
+  });
+
+  await main([PR_URL]);
+
+  const [review] = calls.posted;
+  assert.equal(review.comments.length, 50);
+  assert.equal(review.comments.at(-1).line, 60);
+  assert.deepEqual(review.comments.slice(0, 49).map((c) => c.line), Array.from({ length: 49 }, (_, i) => i + 1));
+  assert.match(review.body, /^reviewbuddy found 60 issues in 1 file/);
+  assert.match(review.body, /Only the 50 most severe findings are posted inline, so the review stays readable\. The other 10:\n- `src\/gen\.js:50` \*\*\[SUGGESTION\]\*\* Finding 50\n/);
+  assert.match(review.body, /- `src\/gen\.js:59` \*\*\[SUGGESTION\]\*\* Finding 59/);
+}));
+
+test('the JSON and SARIF output list what wasn\'t reviewed', () => github(async () => {
+  fakeGitHub({
+    diffStatus: 406, prFiles: fourFiles, findings: findingIn, source: null, ollamaStatus: (f) => (f === 'src/c.js' ? 400 : undefined),
+  });
+  const json = join(dir, 'out.json');
+  const sarif = join(dir, 'out.sarif');
+
+  await main([PR_URL, '--dry-run', '--max-files', '3', '--output', json]);
+  const doc = JSON.parse(await readFile(json, 'utf8'));
+  assert.deepEqual(doc.summary, { files: 2, findings: 2, notReviewed: 2 });
+  assert.deepEqual(doc.notReviewed, [
+    { path: 'src/d.js', reason: 'over --max-files 3' },
+    { path: 'src/c.js', reason: 'failed: Ollama returned HTTP 400: model error for src/c.js' },
+  ]);
+
+  await main([PR_URL, '--dry-run', '--max-files', '3', '--output', sarif]);
+  const [invocation] = JSON.parse(await readFile(sarif, 'utf8')).runs[0].invocations;
+  assert.equal(invocation.executionSuccessful, false);
+  assert.deepEqual(invocation.toolExecutionNotifications.map((n) => [n.level, n.locations[0].physicalLocation.artifactLocation.uri]), [
+    ['warning', 'src/d.js'],
+    ['error', 'src/c.js'],
+  ]);
+}));

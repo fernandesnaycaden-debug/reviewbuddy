@@ -1,6 +1,6 @@
 import { buildContext, matchesDiff } from './context.js';
 import { addedLines, chunkDiff, newLineTexts, numberDiffLines } from './diff.js';
-import { info } from './log.js';
+import { info, warn } from './log.js';
 import { chat, promptChars } from './providers/index.js';
 
 export const SEVERITIES = ['bug', 'security', 'performance', 'suggestion'];
@@ -103,26 +103,34 @@ const RETRY_NOTE = '\n\nYour previous reply was not valid JSON in the required s
  * source: the file's new version, sent as reference if it fits the provider's budget (null = diff only).
  * timeoutMs limits each model request (undefined = the provider's default).
  * rules: the repo's .reviewbuddy.md, added to the system prompt. Its length comes out of each piece's budget.
+ * maxChunks: review at most this many pieces, the first ones (0 = all); onPartial({ reviewed, total }) hears when that cut any.
  */
-export async function reviewDiff(filename, diff, { timeoutMs, source = null, rules } = {}) {
+export async function reviewDiff(filename, diff, {
+  timeoutMs, source = null, rules, maxChunks = 0, onPartial,
+} = {}) {
   if (source != null && !matchesDiff(source, diff)) {
-    console.warn(`  ${filename} doesn't match the diff (another version checked out?), reviewing the diff alone.`);
+    warn(`  ${filename} doesn't match the diff (another version checked out?), reviewing the diff alone.`);
     source = null;
   }
   const system = systemPrompt(rules);
   // Characters the rules add to every request. 0 without rules, so nothing changes then.
   const extra = system.length - SYSTEM_PROMPT.length;
-  const chunks = chunkDiff(diff, Math.min(MAX_CHUNK_CHARS, promptChars() - extra));
+  const all = chunkDiff(diff, Math.min(MAX_CHUNK_CHARS, promptChars() - extra));
+  const chunks = maxChunks > 0 ? all.slice(0, maxChunks) : all;
+  if (chunks.length < all.length) {
+    warn(`  ${filename} is ${all.length} parts; reviewing only the first ${chunks.length} (--max-chunks-per-file).`);
+    onPartial?.({ reviewed: chunks.length, total: all.length });
+  }
   const comments = [];
   for (const [i, chunk] of chunks.entries()) {
-    if (chunks.length > 1) info(`  part ${i + 1}/${chunks.length} ...`);
+    if (all.length > 1) info(`  part ${i + 1}/${all.length} ...`);
     comments.push(...await reviewChunk(filename, chunk, { source, timeoutMs, system, extra }));
   }
 
   const added = addedLines(diff);
   const kept = comments.filter((c) => added.has(c.line));
   if (kept.length < comments.length) {
-    console.warn(`  Dropped ${comments.length - kept.length} comment(s) on lines that weren't added.`);
+    warn(`  Dropped ${comments.length - kept.length} comment(s) on lines that weren't added.`);
   }
   const texts = newLineTexts(diff);
   return kept.map(({ suggestion, ...c }) => {
@@ -144,10 +152,10 @@ async function reviewChunk(filename, diff, { source, timeoutMs, system, extra })
     const reply = await chat(system, attempt === 1 ? userPrompt : userPrompt + RETRY_NOTE, COMMENTS_SCHEMA, { timeoutMs });
     const comments = parseComments(reply);
     if (comments) return comments;
-    if (attempt === 1) console.warn('Warning: model returned invalid JSON, retrying once...');
+    if (attempt === 1) warn('Warning: model returned invalid JSON, retrying once...');
   }
 
-  console.warn('Warning: model returned invalid JSON twice, skipping this part of the file.');
+  warn('Warning: model returned invalid JSON twice, skipping this part of the file.');
   return [];
 }
 

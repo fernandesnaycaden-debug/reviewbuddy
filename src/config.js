@@ -14,6 +14,11 @@ export const CONFIG_FILE = '.reviewbuddy.json';
 export const RULES_FILE = '.reviewbuddy.md';
 // About 1,300 tokens. The rules go into every request, and Ollama's whole prompt budget is 16,000 characters.
 export const MAX_RULES_CHARS = 4000;
+// More files at once than this only trips rate limits; no provider's limits allow it to pay off.
+export const MAX_CONCURRENCY = 16;
+// A piece is up to 16,000 characters on Ollama and more on cloud providers, so 10 pieces cover a few
+// thousand changed lines. A file bigger than that is almost always generated or vendored code.
+export const DEFAULT_MAX_CHUNKS_PER_FILE = 10;
 
 // Key names that hold credentials. Those belong in environment variables or Actions secrets, never in the repo.
 const SECRET_KEY = /api[-_]?key|token|secret|password|credential|_key$/i;
@@ -58,6 +63,15 @@ const FIELDS = {
     }
     return { timeoutMs: value * 1000 };
   },
+  concurrency(value, where) {
+    return { concurrency: countField(value, where, { min: 1, max: MAX_CONCURRENCY }) };
+  },
+  maxFiles(value, where) {
+    return { maxFiles: countField(value, where, { min: 0 }) };
+  },
+  maxChunksPerFile(value, where) {
+    return { maxChunksPerFile: countField(value, where, { min: 0 }) };
+  },
   format(value, where) {
     if (typeof value !== 'string' || !FORMATS.includes(value.toLowerCase())) {
       throw new Error(`${where} must be one of: ${FORMATS.join(', ')}.`);
@@ -66,9 +80,18 @@ const FIELDS = {
   },
 };
 
+/** A .reviewbuddy.json value that must be a whole number from min to max. */
+function countField(value, where, { min = 0, max = Infinity }) {
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`${where} must be a whole number${rangeText({ min, max })}.`);
+  }
+  return value;
+}
+
 /**
  * Parse and validate .reviewbuddy.json. label names the file in errors.
- * Returns { provider?, model?, ignore?, defaultIgnore?, minSeverity?, failOn?, timeoutMs?, format? }.
+ * Returns { provider?, model?, ignore?, defaultIgnore?, minSeverity?, failOn?, timeoutMs?, format?,
+ * concurrency?, maxFiles?, maxChunksPerFile? }.
  * Unknown keys are warned about and skipped; anything that looks like a secret is an error.
  */
 export function parseConfig(text, label = CONFIG_FILE) {
@@ -223,6 +246,9 @@ export function resolveSettings({ flags = {}, env = {}, file = {} }) {
   const minSeverity = given(flags, env, 'min-severity', 'REVIEWBUDDY_MIN_SEVERITY');
   const timeout = given(flags, env, 'timeout', 'REVIEWBUDDY_TIMEOUT');
   const format = given(flags, env, 'format', 'REVIEWBUDDY_FORMAT');
+  const concurrency = given(flags, env, 'concurrency', 'REVIEWBUDDY_CONCURRENCY');
+  const maxFiles = given(flags, env, 'max-files', 'REVIEWBUDDY_MAX_FILES');
+  const maxChunks = given(flags, env, 'max-chunks-per-file', 'REVIEWBUDDY_MAX_CHUNKS_PER_FILE');
   const defaultIgnore = flags['no-default-ignore'] ? false : file.defaultIgnore ?? true;
 
   return {
@@ -234,6 +260,13 @@ export function resolveSettings({ flags = {}, env = {}, file = {} }) {
     timeoutMs: timeout ? parseTimeout(timeout.value, timeout.label) : file.timeoutMs,
     // undefined: --output's extension decides, else text.
     format: format ? parseFormat(format.value, format.label) : file.format,
+    // undefined: the provider's default (see defaultConcurrency).
+    concurrency: concurrency ? parseCount(concurrency.value, concurrency.label, { min: 1, max: MAX_CONCURRENCY }) : file.concurrency,
+    // 0: no limit.
+    maxFiles: maxFiles ? parseCount(maxFiles.value, maxFiles.label, { min: 0 }) : file.maxFiles ?? 0,
+    maxChunksPerFile: maxChunks
+      ? parseCount(maxChunks.value, maxChunks.label, { min: 0 })
+      : file.maxChunksPerFile ?? DEFAULT_MAX_CHUNKS_PER_FILE,
     defaultIgnore,
     ignorePatterns: [
       ...(defaultIgnore ? DEFAULT_IGNORE : []),
@@ -295,4 +328,18 @@ export function parseTimeout(value, label = '--timeout') {
     throw new Error(`Invalid timeout "${value}" in ${label}: give a number of seconds, or 0 for no limit.`);
   }
   return seconds * 1000;
+}
+
+/** A whole number from min to max (a string or a number). label names the source in errors. */
+export function parseCount(value, label, { min = 0, max = Infinity } = {}) {
+  const text = String(value).trim();
+  const count = Number(text);
+  if (!/^\d+$/.test(text) || count < min || count > max) {
+    throw new Error(`Invalid value "${text}" in ${label}: give a whole number${rangeText({ min, max })}.`);
+  }
+  return count;
+}
+
+function rangeText({ min = 0, max = Infinity }) {
+  return max === Infinity ? ` of at least ${min}` : ` from ${min} to ${max}`;
 }

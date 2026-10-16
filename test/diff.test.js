@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import {
-  addedLines, chunkDiff, commentableLines, decodeDiff, numberDiffLines, splitDiff,
+  addedLines, chunkDiff, commentableLines, decodeDiff, filesFromApi, numberDiffLines, patchToFile, splitDiff,
 } from '../src/diff.js';
 
 const gitDiff = [
@@ -107,4 +107,56 @@ test('decodeDiff handles empty input and a lone byte order mark', () => {
   assert.equal(decodeDiff(Buffer.alloc(0)), '');
   assert.equal(decodeDiff(Buffer.from([0xff, 0xfe])), '');
   assert.equal(decodeDiff(Buffer.from([0xfe, 0xff, 0x00])), '');
+});
+
+/** The hunks of a single-file git diff: what GitHub's files API sends as a file's patch. */
+function patchOf(fileDiff) {
+  const lines = fileDiff.split('\n');
+  return lines.slice(lines.findIndex((l) => l.startsWith('@@ '))).join('\n');
+}
+
+/**
+ * What the review uses of a file: its numbered hunks and the lines it may comment on.
+ * The headers may differ: the files API has no "index" line, which carries no line numbers.
+ */
+function lineView(diff) {
+  return { numbered: patchOf(numberDiffLines(diff)), commentable: [...commentableLines(diff)], added: [...addedLines(diff)] };
+}
+
+test('patchToFile numbers lines exactly as splitDiff does for the same file', () => {
+  const [fromDiff] = splitDiff(gitDiff);
+  const fromApi = patchToFile({ filename: 'src/a.js', status: 'modified', patch: patchOf(fromDiff.diff) });
+  assert.equal(fromApi.filename, 'src/a.js');
+  assert.deepEqual(lineView(fromApi.diff), lineView(fromDiff.diff));
+  assert.deepEqual(chunkDiff(fromApi.diff, 40).map((c) => lineView(c).added), chunkDiff(fromDiff.diff, 40).map((c) => lineView(c).added));
+});
+
+test('patchToFile builds headers for added and renamed files', () => {
+  const added = patchToFile({ filename: 'new.js', status: 'added', patch: '@@ -0,0 +1,2 @@\n+a();\n+b();' });
+  assert.equal(added.diff, 'diff --git a/new.js b/new.js\n--- /dev/null\n+++ b/new.js\n@@ -0,0 +1,2 @@\n+a();\n+b();');
+  assert.deepEqual([...addedLines(added.diff)], [1, 2]);
+  assert.deepEqual(splitDiff(added.diff), [added]);
+
+  const renamed = patchToFile({
+    filename: 'lib/b.js', previous_filename: 'src/b.js', status: 'renamed', patch: '@@ -3 +3 @@\n-x\n+y\n',
+  });
+  assert.match(renamed.diff, /^diff --git a\/src\/b\.js b\/lib\/b\.js\n--- a\/src\/b\.js\n\+\+\+ b\/lib\/b\.js\n/);
+  assert.deepEqual(splitDiff(renamed.diff), [renamed]);
+});
+
+test('patchToFile skips files without a patch or without added lines', () => {
+  assert.equal(patchToFile({ filename: 'img.png', status: 'modified' }), null);
+  assert.equal(patchToFile({ filename: 'old.js', status: 'removed', patch: '@@ -1 +0,0 @@\n-gone();' }), null);
+});
+
+test('filesFromApi lists files GitHub sent no patch for as too large, but not binary files or renames', () => {
+  const { files, tooLarge } = filesFromApi([
+    { filename: 'a.js', status: 'modified', additions: 1, patch: '@@ -1 +1 @@\n-x\n+y' },
+    { filename: 'huge.js', status: 'modified', additions: 40000 },
+    { filename: 'img.png', status: 'modified', additions: 0 },
+    { filename: 'moved.js', previous_filename: 'was.js', status: 'renamed', additions: 0 },
+    { filename: 'gone.js', status: 'removed', additions: 0, patch: '@@ -1 +0,0 @@\n-x' },
+  ]);
+  assert.deepEqual(files.map((f) => f.filename), ['a.js']);
+  assert.deepEqual(tooLarge, ['huge.js']);
 });

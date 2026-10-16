@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, mock, test } from 'node:test';
-import { fetchWithRetry } from '../src/http.js';
+import { fetchWithRetry, resetPauses } from '../src/http.js';
+import { buffered } from '../src/log.js';
 
 const fast = { baseDelayMs: 1 };
 
@@ -18,7 +19,10 @@ function networkError(code) {
 }
 
 beforeEach(() => mock.method(console, 'warn', () => {}));
-afterEach(() => mock.restoreAll());
+afterEach(() => {
+  mock.restoreAll();
+  resetPauses();
+});
 
 test('retries network errors, then returns the response', async () => {
   const fetch = mockFetch(networkError('ECONNRESET'), new Response('ok'));
@@ -81,4 +85,61 @@ test('times out without retrying', async () => {
     { name: 'TimeoutError', message: 'Slow did not finish within 0.02s' },
   );
   assert.equal(fetch.mock.callCount(), 1);
+});
+
+/** Mock fetch: the first request to a 'limited' URL gets a 429 with Retry-After; every call's time is recorded. */
+function rateLimitedFetch(retryAfter) {
+  const calls = [];
+  let limited = false;
+  mock.method(globalThis, 'fetch', async (url) => {
+    calls.push({ url, at: performance.now() });
+    if (url.includes('limited') && !limited) {
+      limited = true;
+      return new Response('', { status: 429, headers: { 'Retry-After': retryAfter } });
+    }
+    return new Response('ok');
+  });
+  return calls;
+}
+
+test('a 429 pauses every request to the same host, not just the one that got it', async () => {
+  const calls = rateLimitedFetch('0.1');
+  const start = performance.now();
+  await Promise.all([
+    fetchWithRetry('https://api.test/limited', {}, fast),
+    (async () => {
+      // Starts while the first is paused.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return fetchWithRetry('https://api.test/second', {}, fast);
+    })(),
+  ]);
+  const second = calls.find((c) => c.url === 'https://api.test/second').at - start;
+  assert.ok(second >= 90, `second request went out after ${second}ms`);
+  assert.equal(calls.length, 3);
+});
+
+test('a pause on one host does not hold up another', async () => {
+  const calls = rateLimitedFetch('0.2');
+  const start = performance.now();
+  const limited = fetchWithRetry('https://api.test/limited', {}, fast);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await fetchWithRetry('https://other.test/x', {}, fast);
+  const elsewhere = calls.find((c) => c.url === 'https://other.test/x').at - start;
+  assert.ok(elsewhere < 150, `other host waited ${elsewhere}ms`);
+  await limited;
+});
+
+test('a pause is announced right away, once, not held back with a file\'s output', async () => {
+  rateLimitedFetch('0');
+  const { lines } = await buffered(() => fetchWithRetry('https://api.test/limited', {}, { ...fast, label: 'Groq' }));
+  const warned = console.warn.mock.calls.map((c) => c.arguments.join(' '));
+  assert.deepEqual(warned, ['Groq rate limited (HTTP 429), pausing requests to it for 0.0s (1/3)...']);
+  assert.deepEqual(lines, []);
+});
+
+test('other retries are held back with the file\'s output', async () => {
+  mockFetch(new Response('', { status: 503 }), new Response('ok'));
+  const { lines } = await buffered(() => fetchWithRetry('https://x.test', {}, { ...fast, label: 'Groq' }));
+  assert.equal(console.warn.mock.callCount(), 0);
+  assert.match(lines[0][1][0], /^Groq returned HTTP 503, retrying in/);
 });

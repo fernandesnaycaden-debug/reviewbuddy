@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, mock, test } from 'node:test';
 import {
-  getCompareDiff, getFileContent, getPullRequest, getPullRequestDiff, listReviewComments, listReviews, postReview,
+  getCompareDiff, getCompareFiles, getFileContent, getPullRequest, getPullRequestDiff, listPullRequestFiles,
+  listReviewComments, listReviews, MAX_PR_FILES, postReview,
 } from '../src/github.js';
+import { resetPauses } from '../src/http.js';
 
 const pr = { owner: 'o', repo: 'r', number: 12 };
 
@@ -16,7 +18,10 @@ function json(body, status = 200) {
 }
 
 beforeEach(() => mock.method(console, 'warn', () => {}));
-afterEach(() => mock.restoreAll());
+afterEach(() => {
+  mock.restoreAll();
+  resetPauses();
+});
 
 test('getPullRequest fetches the pull request with the token', async () => {
   const fetch = mockFetch(json({ head: { sha: 'abc' } }));
@@ -155,4 +160,60 @@ test('network errors are reported as GitHub request failures', async () => {
     postReview(pr, 'tok', { commitId: 'abc', body: '', comments: [] }),
     /Request to GitHub failed: getaddrinfo ENOTFOUND/,
   );
+});
+
+test('getPullRequestDiff throws with status 406 when the diff is too large, so the caller can fall back', async () => {
+  mockFetch(json({ message: 'Sorry, the diff exceeded the maximum number of files (300).' }, 406));
+  await assert.rejects(getPullRequestDiff(pr, 'tok'), (err) => err.status === 406 && /too large for GitHub's diff format/.test(err.message));
+});
+
+test('listPullRequestFiles reads the files API 100 at a time', async () => {
+  const page1 = Array.from({ length: 100 }, (_, i) => ({ filename: `f${i}.js`, patch: '@@ -1 +1 @@\n+x' }));
+  const fetch = mockFetch(json(page1), json([{ filename: 'last.js' }]));
+  const files = await listPullRequestFiles(pr, 'tok');
+  assert.equal(files.length, 101);
+  assert.deepEqual(fetch.mock.calls.map((c) => c.arguments[0]), [
+    'https://api.github.com/repos/o/r/pulls/12/files?per_page=100&page=1',
+    'https://api.github.com/repos/o/r/pulls/12/files?per_page=100&page=2',
+  ]);
+});
+
+test('listPullRequestFiles stops at GitHub\'s 3000-file cap', async () => {
+  const page = Array.from({ length: 100 }, (_, i) => ({ filename: `f${i}.js` }));
+  const fetch = mock.method(globalThis, 'fetch', async () => json(page));
+  assert.equal((await listPullRequestFiles(pr, 'tok')).length, MAX_PR_FILES);
+  assert.equal(fetch.mock.callCount(), MAX_PR_FILES / 100);
+});
+
+test('getCompareFiles reads the compare API\'s file list, one commit per page, and null when the commit is gone', async () => {
+  const files = [{ filename: 'a.js', patch: '@@ -1 +1 @@\n+x' }];
+  const fetch = mockFetch(json({ commits: [{}], files }));
+  assert.deepEqual(await getCompareFiles(pr, 'tok', 'old', 'new'), files);
+  const [url, init] = fetch.mock.calls[0].arguments;
+  assert.equal(url, 'https://api.github.com/repos/o/r/compare/old...new?per_page=1');
+  assert.equal(init.headers.Accept, 'application/vnd.github+json');
+
+  mockFetch(json({ message: 'Not Found' }, 404));
+  assert.equal(await getCompareFiles(pr, 'tok', 'old', 'new'), null);
+});
+
+test('getCompareDiff throws with status 406 for a diff too large to send', async () => {
+  mockFetch(json({ message: 'too large' }, 406));
+  await assert.rejects(getCompareDiff(pr, 'tok', 'old', 'new'), (err) => err.status === 406);
+});
+
+test('a secondary rate limit (403 with Retry-After) is waited out and retried, even when posting', async () => {
+  const fetch = mockFetch(
+    new Response('{"message":"You have exceeded a secondary rate limit"}', { status: 403, headers: { 'Retry-After': '0' } }),
+    json({ html_url: 'https://github.com/o/r/pull/12#review' }),
+  );
+  const posted = await postReview(pr, 'tok', { commitId: 'abc', body: '', comments: [] });
+  assert.equal(posted.html_url, 'https://github.com/o/r/pull/12#review');
+  assert.equal(fetch.mock.callCount(), 2);
+});
+
+test('a plain 403 is not retried', async () => {
+  const fetch = mockFetch(json({ message: 'Forbidden' }, 403));
+  await assert.rejects(getPullRequest(pr, 'tok'), /HTTP 403/);
+  assert.equal(fetch.mock.callCount(), 1);
 });

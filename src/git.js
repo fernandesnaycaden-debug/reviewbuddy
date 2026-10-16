@@ -4,6 +4,7 @@
 import { execFile } from 'node:child_process';
 import { resolve } from 'node:path';
 import { promisify } from 'node:util';
+import { warn } from './log.js';
 
 const run = promisify(execFile);
 // A big branch diff can be many megabytes; Node's default 1 MiB would cut it off.
@@ -115,7 +116,7 @@ export async function gitShow(root, spec, path, { exec } = {}) {
     return await runGit(['cat-file', 'blob', `${spec}${path}`], root, { exec });
   } catch (err) {
     // A file added in the working tree but not staged, or deleted since: no version at spec.
-    if (!/does not exist|exists on disk|(?:not a valid|invalid) object name/i.test(err.stderr)) console.warn(`  Could not read ${path} from git for context (${err.message}), reviewing the diff alone.`);
+    if (!/does not exist|exists on disk|(?:not a valid|invalid) object name/i.test(err.stderr)) warn(`  Could not read ${path} from git for context (${err.message}), reviewing the diff alone.`);
     return null;
   }
 }

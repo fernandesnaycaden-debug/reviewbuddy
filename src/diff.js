@@ -47,6 +47,41 @@ export function splitDiff(diff) {
 }
 
 /**
+ * One file from GitHub's files API ({ filename, previous_filename, status, patch }) as the
+ * { filename, diff } splitDiff gives for it, so the rest of the review can't tell them apart.
+ * The patch is only the hunks; this adds the headers. null without a patch or added lines.
+ */
+export function patchToFile({ filename, previous_filename: previous = filename, status, patch }) {
+  if (!patch || !patch.split(/\r?\n/).some((line) => line.startsWith('+') && !line.startsWith('+++'))) return null;
+  const diff = [
+    `diff --git a/${previous} b/${filename}`,
+    status === 'added' ? '--- /dev/null' : `--- a/${previous}`,
+    `+++ b/${filename}`,
+    patch.replace(/\r?\n$/, ''),
+  ].join('\n');
+  return { filename, diff };
+}
+
+/**
+ * GitHub's files API entries as { files, tooLarge }: files as splitDiff would give them, and the
+ * names of files with added lines but no patch, which GitHub leaves out when a file's diff is too large.
+ * Binary files and pure renames have no added lines and are left out, as splitDiff does.
+ */
+export function filesFromApi(entries) {
+  const files = [];
+  const tooLarge = [];
+  for (const entry of entries) {
+    if (entry.patch) {
+      const file = patchToFile(entry);
+      if (file) files.push(file);
+    } else if (entry.additions > 0) {
+      tooLarge.push(entry.filename);
+    }
+  }
+  return { files, tooLarge };
+}
+
+/**
  * Small models are bad at counting lines inside a diff, so we do it for them:
  * every added or context line gets its line number in the new file.
  */
