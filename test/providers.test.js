@@ -224,7 +224,7 @@ test('openrouter adds attribution headers and only routes to providers that hono
 
 // Gemini
 
-test('gemini puts the key in a header and the schema in responseFormat', async () => {
+test('gemini puts the key in a header and the schema in responseSchema', async () => {
   process.env.GEMINI_API_KEY = KEY;
   const requests = mockFetch(Response.json({
     candidates: [{ content: { parts: [{ text: 'thinking...', thought: true }, { text: '{"comments":' }, { text: '[]}' }] } }],
@@ -238,7 +238,8 @@ test('gemini puts the key in a header and the schema in responseFormat', async (
   assert.equal(headers['x-goog-api-key'], KEY);
   assert.deepEqual(body.systemInstruction, { parts: [{ text: 'sys' }] });
   assert.deepEqual(body.contents, [{ role: 'user', parts: [{ text: 'user' }] }]);
-  assert.deepEqual(body.generationConfig.responseFormat, { text: { mimeType: 'application/json', schema: SCHEMA } });
+  assert.equal(body.generationConfig.responseMimeType, 'application/json');
+  assert.deepEqual(body.generationConfig.responseSchema, { type: 'object', properties: { comments: { type: 'array' } }, required: ['comments'] });
 });
 
 test('gemini treats a blocked prompt as no findings', async () => {

@@ -22,6 +22,16 @@ export function checkConfig() {
   return requireKey('GEMINI_API_KEY', LABEL, 'https://aistudio.google.com/apikey');
 }
 
+function geminiSchema(schema) {
+  if (!schema || typeof schema !== 'object') return schema;
+  if (Array.isArray(schema)) return schema.map(geminiSchema);
+  const out = {};
+  for (const [k, v] of Object.entries(schema)) {
+    if (k !== 'additionalProperties') out[k] = geminiSchema(v);
+  }
+  return out;
+}
+
 /**
  * Send a system + user prompt to Gemini and return the reply text, constrained to schema.
  * The key goes in a header rather than the URL, so it can't end up in an error message.
@@ -39,7 +49,8 @@ export async function chat(systemPrompt, userPrompt, schema, { timeoutMs = DEFAU
       contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
       generationConfig: {
         temperature: 0.2,
-        responseFormat: { text: { mimeType: 'application/json', ...(schema && { schema }) } },
+        responseMimeType: 'application/json',
+        ...(schema && { responseSchema: geminiSchema(schema) }),
       },
     },
   }));
