@@ -1,12 +1,12 @@
 # 🔍 ReviewBuddy Report
 
-> **3 issues** found across **1 file** in 8.9s
+> **4 issues** found across **1 file** in 87.5s
 
 | Detail | Value |
 |--------|-------|
-| Provider | gemini |
-| Model | `gemini-3.8-flash` |
-| Date | 17/10/2026, 10:58:55 am |
+| Provider | ollama |
+| Model | `qwen2.5-coder:7b` |
+| Date | 17/10/2026, 11:11:59 am |
 | Files reviewed | 1 |
 
 ---
@@ -15,6 +15,7 @@
 
 | Line | Severity | Issue |
 |------|----------|-------|
-| 4 | 🔴 **SECURITY** | Hardcoded live API key in source code. Store secrets in environment variables or a secrets manager instead. |
-| 15 | 🔴 **SECURITY** | SQL query built via string concatenation is vulnerable to SQL injection. Use parameterized queries ($1) instead. |
-| 22 | 🟠 **BUG** | Off-by-one error in loop condition (`<=` instead of `<`). This will access an out-of-bounds element (`undefined`), resulting in `total` becoming `NaN`.<br>**Fix:** `for (let i = 0; i < numbers.length; i++) {` |
+| 4 | 🔴 **SECURITY** | Hardcoded API key in source code. Use environment variables.<br>**Fix:** `const PAYMENT_API_KEY = process.env.PAYMENT_API_KEY;` |
+| 15 | 🔴 **SECURITY** | SQL injection vulnerability. Use parameterized queries.<br>**Fix:** `const sql = 'SELECT * FROM orders WHERE status = $1 ORDER BY created_at DESC'; const result = await db.query(sql, [status]);` |
+| 22 | 🟠 **BUG** | Off-by-one error in loop. Use < instead of <=.<br>**Fix:** `for (let i = 0; i < numbers.length; i++) {` |
+| 23 | 🟠 **BUG** | Unsanitized user input used in fetch body. Use parameterized queries or validate input.<br>**Fix:** `` const response = await fetch(`${PAYMENT_API_URL}/charges`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${PAYMENT_API_KEY}`, }, body: JSON.stringify({ customer: customerId, amount: amountCents }), }); `` |
