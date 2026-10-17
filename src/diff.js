@@ -114,6 +114,14 @@ export function newLineTexts(diff) {
 }
 
 /**
+ * The hunk (0, 1, ...) each added or context line is in, by its line number in the new file.
+ * GitHub only accepts a multi-line comment whose first and last lines are in the same hunk.
+ */
+export function hunkIndex(diff) {
+  return new Map(annotateLines(diff).filter((l) => l.newLine).map((l) => [l.newLine, l.hunk]));
+}
+
+/**
  * Split a single-file diff into pieces of at most maxChars, cutting only between
  * hunks, so a big file doesn't overflow the model's context window. Each piece keeps
  * the file header, and line numbers stay right because every hunk header carries them.
@@ -151,23 +159,28 @@ export function chunkDiff(diff, maxChars) {
     .map((chunk) => [...header, ...chunk].join('\n'));
 }
 
-/** Pair every line of a single-file diff with its new-file line number, or null if it has none. */
+/**
+ * Pair every line of a single-file diff with its new-file line number (null if it has none)
+ * and the number of the hunk it is in (-1 before the first).
+ */
 function annotateLines(diff) {
   let newLine = 0;
+  let hunk = -1;
   return diff
     .trimEnd()
     .split(/\r?\n/)
     .map((text) => {
-      const hunk = text.match(/^@@ -\d+(?:,\d+)? \+(\d+)/);
-      if (hunk) {
-        newLine = Number(hunk[1]);
-        return { text, newLine: null };
+      const header = text.match(/^@@ -\d+(?:,\d+)? \+(\d+)/);
+      if (header) {
+        newLine = Number(header[1]);
+        hunk++;
+        return { text, newLine: null, hunk };
       }
-      if (text.startsWith('+++') || text.startsWith('---')) return { text, newLine: null };
+      if (text.startsWith('+++') || text.startsWith('---')) return { text, newLine: null, hunk };
       // An empty line is a blank context line whose leading space was stripped by an editor.
       if (newLine > 0 && text === '') text = ' ';
-      if (newLine > 0 && (text.startsWith('+') || text.startsWith(' '))) return { text, newLine: newLine++ };
-      return { text, newLine: null };
+      if (newLine > 0 && (text.startsWith('+') || text.startsWith(' '))) return { text, newLine: newLine++, hunk };
+      return { text, newLine: null, hunk };
     });
 }
 

@@ -1,5 +1,7 @@
 import { buildContext, matchesDiff } from './context.js';
-import { addedLines, chunkDiff, newLineTexts, numberDiffLines } from './diff.js';
+import {
+  addedLines, chunkDiff, hunkIndex, newLineTexts, numberDiffLines,
+} from './diff.js';
 import { info, warn } from './log.js';
 import { chat, promptChars } from './providers/index.js';
 
@@ -9,7 +11,7 @@ export const SEVERITY_ORDER = ['security', 'bug', 'performance', 'suggestion'];
 
 // The provider constrains the reply to this schema, so the model can't answer in the wrong shape.
 // Strict modes (Anthropic, Groq) need every property required and additionalProperties: false,
-// so "suggestion" is required too, and "" means there is none.
+// so "endLine" and "suggestion" are required too: endLine 0 and suggestion "" mean there is none.
 const COMMENTS_SCHEMA = {
   type: 'object',
   properties: {
@@ -19,11 +21,12 @@ const COMMENTS_SCHEMA = {
         type: 'object',
         properties: {
           line: { type: 'integer' },
+          endLine: { type: 'integer' },
           severity: { type: 'string', enum: SEVERITIES },
           message: { type: 'string' },
           suggestion: { type: 'string' },
         },
-        required: ['line', 'severity', 'message', 'suggestion'],
+        required: ['line', 'endLine', 'severity', 'message', 'suggestion'],
         additionalProperties: false,
       },
     },
@@ -37,6 +40,8 @@ const COMMENTS_SCHEMA = {
 const MAX_CHUNK_CHARS = 16000;
 // Room for the headers around the file context.
 const CONTEXT_FRAME_CHARS = 200;
+// Longest range one finding may cover. Longer ones are clamped to their first line.
+export const MAX_RANGE_LINES = 20;
 
 export const SYSTEM_PROMPT = `You are a senior code reviewer. Review the diff you are given.
 
@@ -50,6 +55,8 @@ Rules:
 - Do NOT comment on style, formatting, naming, or missing comments.
 - Only comment on added lines (marked with "+"). Ignore context and removed lines.
 - Each added line is prefixed with its line number in the new file. Use that number for "line".
+- "endLine" is 0 for a problem on one line. Only when the problem really is a block of added lines (e.g. a whole
+  unsafe loop or try/catch), make "line" its first line and "endLine" its last. Keep it short: at most 20 lines.
 - Do NOT report a problem the surrounding code already handles, e.g. a value that is validated or null-checked
   before it reaches the line, or a function that is defined elsewhere in the file.
 - Do not guess about code you cannot see. Report a problem only if you are confident it is real.
@@ -65,13 +72,15 @@ Bug patterns to watch for:
 - Unhandled null/undefined values.
 - Incorrect error handling or swallowed exceptions.
 
-"suggestion" is the exact code that should replace the commented line, so the author can apply it with one click.
-- Give one only when the fix is small, certain, and fits on that single line without changing any other line.
-- Write only the code: no explanation, no markdown fences, no line number, no leading "+".
-- Otherwise use "": when the fix needs several lines, changes elsewhere, a new import, or a decision by the author.
+"suggestion" is the exact code that should replace the commented line (with an "endLine": every line from "line"
+to "endLine"), so the author can apply it with one click.
+- Give one only when the fix is small, certain, and changes no other line. Without an "endLine" it must fit on that
+  single line.
+- Write only the code, indented as in the file: no explanation, no markdown fences, no line numbers, no leading "+".
+- Otherwise use "": when the fix changes lines elsewhere, needs a new import, or needs a decision by the author.
 
 Reply with JSON only, in exactly this shape:
-{"comments": [{"line": <number>, "severity": "bug" | "security" | "performance" | "suggestion", "message": "<short explanation and fix>", "suggestion": "<replacement line, or empty>"}]}`;
+{"comments": [{"line": <number>, "endLine": <last line of the block, or 0>, "severity": "bug" | "security" | "performance" | "suggestion", "message": "<short explanation and fix>", "suggestion": "<replacement code, or empty>"}]}`;
 
 const RULES_START = '=== PROJECT RULES FROM THE REPOSITORY ===';
 const RULES_END = '=== END OF PROJECT RULES ===';
@@ -98,8 +107,9 @@ ${RULES_END}`;
 const RETRY_NOTE = '\n\nYour previous reply was not valid JSON in the required shape. Reply with JSON only, exactly as described.';
 
 /**
- * Review a unified diff and return a list of { line, severity, message, suggestion? } comments.
- * Big diffs are reviewed in pieces. Comments on lines that weren't added are dropped.
+ * Review a unified diff and return a list of { line, endLine?, severity, message, suggestion? } comments.
+ * Big diffs are reviewed in pieces. Comments starting on a line that wasn't added are dropped, and a range
+ * that doesn't fit (see fitRange) becomes a comment on its first line.
  * source: the file's new version, sent as reference if it fits the provider's budget (null = diff only).
  * timeoutMs limits each model request (undefined = the provider's default).
  * rules: the repo's .reviewbuddy.md, added to the system prompt. Its length comes out of each piece's budget.
@@ -132,11 +142,35 @@ export async function reviewDiff(filename, diff, {
   if (kept.length < comments.length) {
     warn(`  Dropped ${comments.length - kept.length} comment(s) on lines that weren't added.`);
   }
+  const hunks = hunkIndex(diff);
   const texts = newLineTexts(diff);
-  return kept.map(({ suggestion, ...c }) => {
-    const fix = cleanSuggestion(suggestion, texts.get(c.line));
+  return kept.map((c) => fitRange(c, hunks)).map(({ suggestion, ...c }) => {
+    const fix = c.endLine
+      ? cleanBlockSuggestion(suggestion, rangeTexts(texts, c))
+      : cleanSuggestion(suggestion, texts.get(c.line));
     return fix ? { ...c, suggestion: fix } : c;
   });
+}
+
+/**
+ * comment as is if its range (line to endLine) can be posted: endLine after line, at most MAX_RANGE_LINES
+ * lines, and all of them in one hunk of the new file (hunks: see hunkIndex). Otherwise a comment on its
+ * first line alone, without its suggestion, which was written for the whole range.
+ */
+export function fitRange(comment, hunks) {
+  const { line, endLine } = comment;
+  if (endLine === undefined) return comment;
+  const hunk = hunks.get(line);
+  if (endLine > line && endLine - line < MAX_RANGE_LINES && hunk !== undefined && hunks.get(endLine) === hunk) {
+    return comment;
+  }
+  const { endLine: _end, suggestion: _fix, ...single } = comment;
+  return single;
+}
+
+/** The current text of each line from line to endLine. */
+function rangeTexts(texts, { line, endLine }) {
+  return Array.from({ length: endLine - line + 1 }, (_, i) => texts.get(line + i));
 }
 
 /** Review one piece of diff. system: the system prompt; extra: what the repo's rules added to it. */
@@ -171,7 +205,8 @@ function contextSection(context) {
 /**
  * Parse the model's reply. Returns null if it isn't the JSON we asked for,
  * and silently drops individual comments that are malformed.
- * A suggestion is kept only if it is a single non-empty line; replies without one are fine.
+ * endLine is kept only if it comes after line. A suggestion is kept only if it is a single non-empty line,
+ * or, with an endLine, any non-blank code; replies without one are fine.
  */
 export function parseComments(reply) {
   let parsed;
@@ -186,9 +221,13 @@ export function parseComments(reply) {
     .filter((c) => Number.isInteger(Number(c?.line)) && typeof c.message === 'string')
     .map((c) => {
       const severity = String(c.severity).toLowerCase();
-      const suggestion = singleLine(c.suggestion);
+      const line = Number(c.line);
+      const endLine = Number(c.endLine);
+      const range = Number.isInteger(endLine) && endLine > line;
+      const suggestion = range ? codeBlock(c.suggestion) : singleLine(c.suggestion);
       return {
-        line: Number(c.line),
+        line,
+        ...(range && { endLine }),
         severity: SEVERITIES.includes(severity) ? severity : 'suggestion',
         message: c.message.trim(),
         ...(suggestion && { suggestion }),
@@ -204,6 +243,13 @@ function singleLine(suggestion) {
   return line;
 }
 
+/** suggestion with Unix line ends and without a trailing newline, or undefined if it is blank. */
+function codeBlock(suggestion) {
+  if (typeof suggestion !== 'string') return undefined;
+  const code = suggestion.replace(/\r\n?/g, '\n').replace(/\n$/, '');
+  return code.trim() === '' ? undefined : code;
+}
+
 /**
  * The replacement for currentLine, indented like it, or undefined if there is nothing to apply:
  * no suggestion, more than one line, an unknown line, or the same code as now.
@@ -214,6 +260,30 @@ export function cleanSuggestion(suggestion, currentLine) {
   const code = line.trim();
   if (code === currentLine.trim()) return undefined;
   return currentLine.match(/^\s*/)[0] + code;
+}
+
+/**
+ * The replacement for currentLines (a range), or undefined if there is nothing to apply: no suggestion,
+ * an unknown line, or the same code as now. Lines keep their indentation relative to each other, shifted
+ * so the least indented one lines up with the least indented current line.
+ */
+export function cleanBlockSuggestion(suggestion, currentLines) {
+  const code = codeBlock(suggestion);
+  if (code === undefined || currentLines.length === 0 || currentLines.includes(undefined)) return undefined;
+  const lines = code.split('\n');
+  const base = leastIndent(currentLines);
+  const strip = leastIndent(lines).length;
+  const fixed = lines.map((l) => (l.trim() ? base + l.slice(strip).trimEnd() : ''));
+  const same = fixed.length === currentLines.length && fixed.every((l, i) => l.trim() === currentLines[i].trim());
+  return same ? undefined : fixed.join('\n');
+}
+
+/** The indentation of the least indented non-blank line ('' if every line is blank). */
+function leastIndent(lines) {
+  return lines
+    .filter((l) => l.trim())
+    .map((l) => l.match(/^\s*/)[0])
+    .reduce((a, b) => (a === null || b.length < a.length ? b : a), null) ?? '';
 }
 
 /** True if severity is min or more serious. No min keeps everything. */

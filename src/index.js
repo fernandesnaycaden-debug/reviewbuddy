@@ -6,17 +6,18 @@ import {
   annotationsFor, appendStepSummary, inActions, isForkPullRequest, warning,
 } from './actions.js';
 import {
-  dropPosted, findingKey, latestMarkedReview, markerFor, openFindings, parseMarker, postedKeys,
+  blockingReviews, dismissible, dropPosted, findingKey, latestMarkedReview, markerFor, openFindings, parseMarker,
+  postedKeys,
 } from './dedupe.js';
 import {
-  commentableLines, decodeDiff, filesFromApi, splitDiff,
+  decodeDiff, filesFromApi, hunkIndex, splitDiff,
 } from './diff.js';
 import {
   checkRev, GIT_MODES, gitDiff, gitShow,
 } from './git.js';
 import {
-  getCompareDiff, getCompareFiles, getFileContent, getPullRequest, getPullRequestDiff, listPullRequestFiles,
-  listReviewComments, listReviews, MAX_COMPARE_FILES, MAX_PR_FILES, parsePrUrl, postReview,
+  dismissReview, getCompareDiff, getCompareFiles, getFileContent, getPullRequest, getPullRequestDiff,
+  listPullRequestFiles, listReviewComments, listReviews, MAX_COMPARE_FILES, MAX_PR_FILES, parsePrUrl, postReview,
 } from './github.js';
 import {
   findLocalConfig, loadConfig, loadRemoteConfig, resolveSettings,
@@ -26,7 +27,9 @@ import { capInlineComments, MAX_INLINE_COMMENTS, selectFiles } from './limits.js
 import {
   buffered, flush, info, logToStderr, warn,
 } from './log.js';
-import { formatJson, formatSarif, outputFormat } from './output.js';
+import {
+  formatJson, formatSarif, lineRange, outputFormat,
+} from './output.js';
 import { mapPool } from './pool.js';
 import { defaultConcurrency, describe as describeProvider, useProvider } from './providers/index.js';
 import { atLeast, reviewDiff } from './review.js';
@@ -64,6 +67,7 @@ async function run(argv) {
       output: { type: 'string', short: 'o' },
       provider: { type: 'string' },
       'repo-dir': { type: 'string' },
+      'request-changes-on': { type: 'string' },
       since: { type: 'string' },
       staged: { type: 'boolean' },
       timeout: { type: 'string' },
@@ -100,12 +104,10 @@ async function run(argv) {
   routeLogs(settings.format, settings.output);
   if (config.summary) info(config.summary);
 
-  const { failOn, minSeverity } = settings;
+  const { failOn, requestChangesOn, minSeverity } = settings;
   const format = outputFormat(settings.format, settings.output);
-  const unreachable = failOn.filter((s) => !atLeast(s, minSeverity));
-  if (unreachable.length > 0) {
-    warn(`Warning: --fail-on ${unreachable.join(',')} has no effect with --min-severity ${minSeverity}, which leaves those findings out.`);
-  }
+  warnUnreachable('--fail-on', failOn, minSeverity);
+  warnUnreachable('--request-changes-on', requestChangesOn, minSeverity);
   const used = await selectProvider(settings.provider, settings.model);
   if (used === SKIPPED) return;
   info(`Using ${used.provider} (${used.model})\n`);
@@ -113,6 +115,7 @@ async function run(argv) {
   const options = {
     dryRun: flags['dry-run'],
     failOn,
+    requestChangesOn,
     full: flags.full,
     minSeverity,
     repoDir,
@@ -134,6 +137,14 @@ async function run(argv) {
   });
   checkFailOn(findings, failOn);
   checkFailed(notReviewed);
+}
+
+/** Warn that the severities a setting (name) lists below minSeverity can never match: those findings are left out. */
+function warnUnreachable(name, severities, minSeverity) {
+  const unreachable = severities.filter((s) => !atLeast(s, minSeverity));
+  if (unreachable.length > 0) {
+    warn(`Warning: ${name} ${unreachable.join(',')} has no effect with --min-severity ${minSeverity}, which leaves those findings out.`);
+  }
 }
 
 const ONE_INPUT = 'Review one thing at a time: pass only one of --staged, --uncommitted, --branch <base>, --since <rev>, a diff file, a PR URL or - (stdin).';
@@ -380,6 +391,10 @@ async function reviewPullRequest(pr, token, details, options) {
   const done = {
     results: reviewed.results, findings, seconds: reviewed.seconds, notReviewed: reviewed.notReviewed,
   };
+  // Dismisses our earlier change requests that no longer apply; called once this run's review is done.
+  const clear = async () => clearBlocks(pr, token, {
+    reviews, listComments: listOurComments, results: reviewed.results, notReviewed: done.notReviewed, sha: head.sha,
+  }, options);
   if (ourReviews.size > 0 && countIssues(results) > 0) {
     const dropped = dropPosted(results, postedKeys(await listOurComments(), ourReviews));
     results = dropped.results;
@@ -387,6 +402,7 @@ async function reviewPullRequest(pr, token, details, options) {
   }
   if (countIssues(results) === 0) {
     info('No new findings to post.');
+    await clear();
     return done;
   }
 
@@ -401,18 +417,20 @@ async function reviewPullRequest(pr, token, details, options) {
       markerSha: incomplete ? previous?.sha ?? base.sha : head.sha,
       since,
       notReviewed: done.notReviewed,
+      requestChangesOn: options.requestChangesOn,
       ...describeProvider(),
     },
   );
 
   if (options.dryRun) {
-    info('Dry run, not posting. The review would be:\n');
+    info(`Dry run, not posting. The review would be (event ${review.event}):\n`);
     info(JSON.stringify(review, null, 2));
+    await clear();
     return done;
   }
   let posted;
   try {
-    posted = await postReview(pr, token, review);
+    posted = await postReviewOrComment(pr, token, review);
   } catch (err) {
     // On a fork PR the workflow's token is read-only; the annotations and job summary still have the findings.
     if (err.status !== 403 || !inActions() || !await isForkPullRequest()) throw err;
@@ -420,7 +438,65 @@ async function reviewPullRequest(pr, token, details, options) {
     return done;
   }
   info(`Posted review: ${posted.html_url}`);
+  await clear();
   return done;
+}
+
+/**
+ * Post the review. GitHub refuses a change request on the token owner's own PR (HTTP 422): then it is
+ * posted as a comment instead, with a warning. Nothing was created on a 422, so posting again can't duplicate it.
+ */
+async function postReviewOrComment(pr, token, review) {
+  try {
+    return await postReview(pr, token, review);
+  } catch (err) {
+    if (review.event !== 'REQUEST_CHANGES' || err.status !== 422 || !/own pull request/i.test(err.message)) throw err;
+    warnUser('GitHub doesn\'t let anyone request changes on their own pull request, and the token belongs to its author, so the review was posted as a comment instead. To block the merge, run reviewbuddy with another account\'s token or in GitHub Actions.');
+    return postReview(pr, token, { ...review, event: 'COMMENT' });
+  }
+}
+
+/**
+ * Dismiss our earlier change requests that no longer apply (see dismissible), or with --dry-run say which would be.
+ * run: { reviews, listComments (the PR's review comments, fetched on demand), results (this run's findings,
+ * posted before or not), notReviewed, sha (the reviewed head) }. A dismissal GitHub refuses only gets a warning:
+ * the review keeps blocking until someone with write access dismisses it.
+ */
+async function clearBlocks(pr, token, {
+  reviews, listComments, results, notReviewed, sha,
+}, { requestChangesOn, full, dryRun }) {
+  const blocking = blockingReviews(reviews);
+  if (requestChangesOn.length === 0 || blocking.length === 0) return;
+  const wholePr = full && notReviewed.length === 0;
+  const ids = dismissible(reviews, await listComments(), {
+    blocking: requestChangesOn,
+    found: flatFindings(results).map((f) => f.severity),
+    full: wholePr,
+    failed: notReviewed.some((n) => n.failed),
+  });
+  const kept = blocking.length - ids.length;
+  if (kept > 0) info(`Keeping ${plural(kept, 'earlier change request')} by reviewbuddy: not every blocking finding is fixed yet.`);
+  const message = wholePr
+    ? `reviewbuddy: a full review of ${short(sha)} found no blocking issues.`
+    : `reviewbuddy: the blocking findings were fixed (the code under them changed) and the review of ${short(sha)} found no new ones.`;
+  for (const id of ids) {
+    if (dryRun) {
+      info(`Would dismiss reviewbuddy's change request #${id}: ${message}`);
+      continue;
+    }
+    try {
+      await dismissReview(pr, token, id, message);
+      info(`Dismissed reviewbuddy's earlier change request #${id}: it no longer applies.`);
+    } catch (err) {
+      warnUser(`Could not dismiss reviewbuddy's earlier change request #${id}: ${err.message} It keeps blocking the merge until someone with write access dismisses it. The token needs "Pull requests: Read and write", and if the branch restricts who can dismiss reviews, its user or app must be on that list.`);
+    }
+  }
+}
+
+/** A warning that shows on the run page in GitHub Actions, and as a plain warning elsewhere. */
+function warnUser(message) {
+  if (inActions()) warning(message);
+  else warn(`Warning: ${message}`);
 }
 
 const TOO_LARGE = 'too large for the GitHub API';
@@ -497,27 +573,28 @@ function short(sha) {
 }
 
 /**
- * Turn review results into the { commitId, body, comments } posted to GitHub.
+ * Turn review results into the { commitId, event, body, comments } posted to GitHub.
+ * event is REQUEST_CHANGES if a finding has a severity in requestChangesOn, else COMMENT (see reviewEvent).
  * GitHub rejects the whole review if a comment points outside the diff,
- * so findings on other lines go into the review body instead.
+ * so findings on other lines go into the review body instead. A range goes on all its lines when GitHub allows it.
  * At most MAX_INLINE_COMMENTS go inline, the most severe first; the rest are listed in the body.
  * An inline comment with a suggestion ends with a ```suggestion block that GitHub can apply in one click.
  * The body lists notReviewed (see reviewFiles) and ends with a hidden marker naming markerSha (default commitId);
  * since (a short SHA) says the review covers only newer commits.
  */
 export function buildReview(results, {
-  commitId, markerSha = commitId, since, model, provider, notReviewed = [],
+  commitId, markerSha = commitId, since, model, provider, notReviewed = [], requestChangesOn = [],
 }) {
   const candidates = [];
   const leftovers = [];
   for (const { filename, diff, comments: found } of results) {
-    const allowed = commentableLines(diff);
+    // The lines GitHub accepts comments on, and their hunks.
+    const hunks = hunkIndex(diff);
     for (const c of found) {
       const body = `**[${c.severity.toUpperCase()}]** ${c.message}`;
-      const listed = `- \`${filename}:${c.line}\` ${body}`;
-      if (allowed.has(c.line)) {
-        const comment = { path: filename, line: c.line, body: c.suggestion ? body + suggestionBlock(c.suggestion) : body };
-        candidates.push({ comment, severity: c.severity, listed });
+      const listed = `- \`${filename}:${lineRange(c)}\` ${body}`;
+      if (hunks.has(c.line)) {
+        candidates.push({ comment: inlineComment(filename, c, body, hunks), severity: c.severity, listed });
       } else {
         leftovers.push(listed);
       }
@@ -527,7 +604,37 @@ export function buildReview(results, {
   const text = reviewBody(results, {
     leftovers, overflow: overflow.map((c) => c.listed), notReviewed, since, model, provider,
   });
-  return { commitId, body: `${fitBody(text)}\n\n${markerFor(markerSha)}`, comments: inline.map((c) => c.comment) };
+  return {
+    commitId,
+    event: reviewEvent(results, requestChangesOn),
+    body: `${fitBody(text)}\n\n${markerFor(markerSha)}`,
+    comments: inline.map((c) => c.comment),
+  };
+}
+
+/**
+ * The inline comment for finding c, whose first line is in the diff (hunks: see hunkIndex). GitHub takes a range as
+ * start_line (first) and line (last), both in the same hunk. A range that isn't goes on its first line, without
+ * its suggestion, which was written for the whole range.
+ */
+function inlineComment(path, c, body, hunks) {
+  const withFix = c.suggestion ? body + suggestionBlock(c.suggestion) : body;
+  if (!c.endLine) return { path, line: c.line, body: withFix };
+  if (hunks.get(c.endLine) === hunks.get(c.line)) {
+    return {
+      path, start_line: c.line, line: c.endLine, body: withFix,
+    };
+  }
+  return { path, line: c.line, body };
+}
+
+/**
+ * The review's event: REQUEST_CHANGES if a finding about to be posted (inline or in the body) has a severity in
+ * requestChangesOn, else COMMENT. Never APPROVE: reviewbuddy can't vouch for code, only point out problems.
+ */
+export function reviewEvent(results, requestChangesOn = []) {
+  const blocks = results.some((r) => r.comments.some((c) => requestChangesOn.includes(c.severity)));
+  return blocks ? 'REQUEST_CHANGES' : 'COMMENT';
 }
 
 // GitHub refuses longer bodies (65,536 characters); this leaves room for the marker.
@@ -540,7 +647,7 @@ function fitBody(text) {
   return `${cut}\n\n_The summary was too long for one GitHub review and was cut here. The job summary and --output have everything._`;
 }
 
-/** A GitHub suggestion block replacing the commented line with code. The fence outgrows any backticks in it. */
+/** A GitHub suggestion block replacing the commented line (or range) with code. The fence outgrows any backticks in it. */
 function suggestionBlock(code) {
   let fence = '```';
   while (code.includes(fence)) fence += '`';
@@ -661,8 +768,8 @@ function printFile(file, finished, total, lines, comments) {
   info(`Reviewed ${file.filename} (${finished}/${total})`);
   flush(lines);
   for (const c of comments) {
-    info(`  ${file.filename}:${c.line} [${c.severity.toUpperCase()}] ${c.message}`);
-    if (c.suggestion) info(`    fix: ${c.suggestion.trim()}`);
+    info(`  ${file.filename}:${lineRange(c)} [${c.severity.toUpperCase()}] ${c.message}`);
+    if (c.suggestion) info(`    fix: ${dedent(c.suggestion).join('\n         ')}`);
   }
   if (comments.length === 0) info('  No issues found.');
   info();
@@ -748,13 +855,25 @@ export function formatReport(results, {
     lines.push('|------|----------|-------|');
     for (const c of comments) {
       const icon = SEVERITY_ICON[c.severity] || 'ℹ️';
-      const fix = c.suggestion ? `<br>**Fix:** ${inlineCode(c.suggestion.trim())}` : '';
-      lines.push(`| ${c.line} | ${icon} **${c.severity.toUpperCase()}** | ${c.message}${fix} |`);
+      const fix = c.suggestion ? `<br>**Fix:** ${fixCode(c.suggestion)}` : '';
+      lines.push(`| ${lineRange(c)} | ${icon} **${c.severity.toUpperCase()}** | ${c.message}${fix} |`);
     }
     lines.push('');
   }
   if (notReviewed.length > 0) lines.push('## Not reviewed', '', ...notReviewed.map(notReviewedLine), '');
   return lines.join('\n');
+}
+
+/** A suggestion inside a table cell: one code span per line, joined with <br>. */
+function fixCode(suggestion) {
+  return dedent(suggestion).map(inlineCode).join('<br>');
+}
+
+/** The non-blank lines of code, without trailing spaces and the indentation they all share. */
+function dedent(code) {
+  const lines = code.split('\n').map((line) => line.trimEnd()).filter(Boolean);
+  const shared = Math.min(...lines.map((line) => line.match(/^\s*/)[0].length));
+  return lines.map((line) => line.slice(shared));
 }
 
 /** code as a Markdown code span that is safe inside a table cell. */

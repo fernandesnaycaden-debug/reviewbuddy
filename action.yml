@@ -1,5 +1,5 @@
 name: reviewbuddy
-description: AI code review on every pull request, posted as inline comments. Can fail the check on chosen severities.
+description: AI code review on every pull request, posted as inline comments. Can fail the check or request changes on chosen severities.
 # Settings also come from the reviewed repo's .reviewbuddy.json and .reviewbuddy.md, read from the PR's base branch.
 # A non-empty input below overrides the same setting in .reviewbuddy.json.
 author: fernandesnaycaden-debug
@@ -9,7 +9,7 @@ branding:
 
 inputs:
   github-token:
-    description: Token used to read the pull request and post the review. Needs pull-requests write permission.
+    description: Token used to read the pull request, post the review and dismiss reviewbuddy's own outdated change requests. Needs pull-requests write permission.
     default: ${{ github.token }}
   provider:
     description: Model provider, one of groq, openrouter, gemini, anthropic (ollama only with OLLAMA_URL set). Always overrides provider in .reviewbuddy.json.
@@ -22,6 +22,9 @@ inputs:
     default: ''
   fail-on:
     description: Comma-separated severities that fail the check (bug, security, performance, suggestion). Empty uses failOn from .reviewbuddy.json, else never fails.
+    default: ''
+  request-changes-on:
+    description: Comma-separated severities that make the review request changes instead of only commenting, like --request-changes-on. It never approves. Empty uses requestChangesOn from .reviewbuddy.json, else only comments.
     default: ''
   min-severity:
     description: Least serious severity to report (security > bug > performance > suggestion), like --min-severity. Empty uses .reviewbuddy.json, else reports everything.
@@ -75,6 +78,7 @@ runs:
         INPUT_MODEL: ${{ inputs.model }}
         INPUT_API_KEY: ${{ inputs.api-key }}
         INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_REQUEST_CHANGES_ON: ${{ inputs.request-changes-on }}
         INPUT_MIN_SEVERITY: ${{ inputs.min-severity }}
         INPUT_IGNORE: ${{ inputs.ignore }}
         INPUT_FULL: ${{ inputs.full }}
@@ -93,6 +97,7 @@ runs:
         export GITHUB_TOKEN="$INPUT_GITHUB_TOKEN"
         export REVIEWBUDDY_PROVIDER="$INPUT_PROVIDER"
         export REVIEWBUDDY_FAIL_ON="$INPUT_FAIL_ON"
+        export REVIEWBUDDY_REQUEST_CHANGES_ON="$INPUT_REQUEST_CHANGES_ON"
         export REVIEWBUDDY_MIN_SEVERITY="$INPUT_MIN_SEVERITY"
         export REVIEWBUDDY_IGNORE="$INPUT_IGNORE"
         export REVIEWBUDDY_TIMEOUT="$INPUT_TIMEOUT"

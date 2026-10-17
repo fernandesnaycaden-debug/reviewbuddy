@@ -218,7 +218,7 @@ The Markdown report includes a summary table, the model name, and per-file findi
 
 - `schemaVersion` changes only when a field is removed or changes meaning. New fields can appear without a bump, so ignore keys you don't know.
 - `path` is relative to the repository root, as in the diff. `line` is the line in the new version of the file.
-- `severity` is `security`, `bug`, `performance` or `suggestion`. `suggestion` (a one-line replacement for that line) and `endLine` are only there when there is one.
+- `severity` is `security`, `bug`, `performance` or `suggestion`. `endLine` is the last line of a [multi-line finding](#multi-line-findings) and `suggestion` the code that replaces the finding's line (or lines); each is only there when there is one.
 - `files` lists every reviewed file, including ones with no findings.
 - `notReviewed` lists files that were left out or only partly reviewed, as `{ "path": "...", "reason": "..." }`: too large for the GitHub API, over `--max-files`, failed, or partly reviewed (see [Large pull requests](#large-pull-requests)). `path` is `null` for a note about files GitHub didn't list at all.
 
@@ -244,6 +244,8 @@ $env:REVIEWBUDDY_FAIL_ON = "security"   # same thing, as a variable; the flag wi
 ```
 
 On a pull request, a finding counts as long as it is still there, not just when it is new: findings from this run count even if they were already posted, and so do inline comments from earlier reviewbuddy reviews whose line hasn't changed since. Once the code under such a comment changes, GitHub marks it outdated and it stops counting. So pushing an unrelated commit doesn't make the check pass, but fixing the flagged line does.
+
+To block a PR through its review instead (a **Request changes** review), and for how the two compare, see [Blocking merges](#blocking-merges).
 
 ## Only report serious findings
 
@@ -280,15 +282,16 @@ npm run review -- https://github.com/owner/repo/pull/12 --dry-run
 
 How the review looks on GitHub:
 
-- It is a plain comment review. reviewbuddy never approves a PR or requests changes.
+- It is a comment review. reviewbuddy never approves a PR. It requests changes only if you ask it to, with `--request-changes-on` (see [Blocking merges](#blocking-merges)).
 - Each finding is an inline comment like **[SECURITY]** Hardcoded API key; load it from an environment variable.
-- When the fix is a small, certain change to that one line, the comment ends with a GitHub suggestion. The author can apply it with **Commit suggestion**, or batch several into one commit from the **Files changed** tab.
+- A problem that covers a block of lines, like a whole loop or `try`/`catch`, is one comment on those lines (see [Multi-line findings](#multi-line-findings)).
+- When the fix is a small, certain change to the commented line (or block), the comment ends with a GitHub suggestion. The author can apply it with **Commit suggestion**, or batch several into one commit from the **Files changed** tab.
 - The review summary says how many issues were found and which model found them. Findings that point at a line outside the diff can't be attached to that line, so they are listed in the summary instead (without a suggestion).
 - At most 50 findings are posted inline, the most severe first; any more are listed in the summary (see [Large pull requests](#large-pull-requests)). So are files that weren't reviewed.
 
 ### Suggested fixes
 
-The model gives a replacement line only when it is sure, and only for a fix that fits on the commented line. reviewbuddy then checks it: an empty suggestion, one spanning several lines, or one identical to the current line is dropped, and the line's original indentation is kept. An inline comment with one is posted like this:
+The model gives a replacement line only when it is sure, and only for a fix that fits on the commented line (a [multi-line finding](#multi-line-findings) can get a replacement for its whole block). reviewbuddy then checks it: an empty suggestion, one spanning several lines on a one-line finding, or one identical to the current line is dropped, and the line's original indentation is kept. An inline comment with one is posted like this:
 
 ````markdown
 **[BUG]** Off-by-one: the loop starts at 1, so the first name is skipped.
@@ -300,6 +303,32 @@ The model gives a replacement line only when it is sure, and only for a fix that
 
 On GitHub that shows as the finding, then a diff of the line with the old version in red and the fix in green, and a **Commit suggestion** button. In the terminal the fix is printed under the finding as `fix: ...`, and in the Markdown report it appears as **Fix:** after the issue.
 
+### Multi-line findings
+
+Most findings are about one line. When the problem really is a block, like a whole unsafe loop or a `try`/`catch` that swallows errors, the model can mark the block: `line` is its first line and `endLine` its last. reviewbuddy keeps a range only if:
+
+- it ends after it starts and spans at most **20 lines**,
+- its first line is an added line (as for every finding), and
+- all its lines are in one hunk of the diff.
+
+Otherwise the finding is kept on its first line alone, and a suggestion written for the whole block is dropped. When posting, GitHub's rule is checked as well: both ends must be in the same hunk of the PR's own diff (an incremental run reviews a different diff). If they aren't, the comment goes on the first line without the suggestion; if even that line isn't in the diff, the finding is listed in the review summary.
+
+On GitHub, a range comment highlights the whole block in the **Files changed** tab, with the comment under its last line, and the conversation shows it as a comment on lines +2 to +4. A multi-line suggestion replaces the whole block:
+
+````markdown
+**[BUG]** Off-by-one: `<=` reads one past the end of `xs`.
+
+```suggestion
+  for (let i = 0; i < xs.length; i++) {
+    use(xs[i]);
+  }
+```
+````
+
+**Commit suggestion** then replaces lines 2 to 4 with these three lines. reviewbuddy keeps the lines' indentation relative to each other and lines the block up with the code it replaces, so a model that drops the leading spaces doesn't break it. A suggestion identical to the current block is dropped.
+
+A range shows up everywhere else too: as `src/a.js:2-4` in the terminal, the Markdown report and the review summary, as `endLine` in [JSON](#json), `region.endLine` in [SARIF](#sarif), and `endLine` on the Actions annotation, which then spans the block.
+
 ### Running it again on the same PR
 
 Each review ends with a hidden marker, `<!-- reviewbuddy:sha=... -->`, that records which commit it reviewed. On the next run reviewbuddy looks for the most recent review with that marker. It doesn't matter who posted it, so a personal token and the GitHub Actions bot share the same history.
@@ -308,7 +337,7 @@ Each review ends with a hidden marker, `<!-- reviewbuddy:sha=... -->`, that reco
 - **New commits:** it reviews only the changes since the reviewed commit (GitHub's compare diff), limited to files the PR itself changes. The review summary says `since abc1234`.
 - **The reviewed commit is gone** (after a force-push or rebase): it says so and reviews the whole PR.
 - **A file failed last time:** that review's marker names the commit the run started from (the earlier reviewed commit, or the PR's base commit for a first review) instead of the head. So the next run reviews those changes again, failed files included, and skips the findings that were already posted.
-- **A finding was already posted:** an inline comment from an earlier reviewbuddy review on the same file, line and severity is not posted again. The run prints how many it skipped.
+- **A finding was already posted:** an inline comment from an earlier reviewbuddy review on the same file, line and severity is not posted again. For a range that is its first line: GitHub lists a range comment with `start_line` (first) and `line` (last), and reviewbuddy maps them back. The run prints how many it skipped.
 - **Nothing new to post:** no review is posted, not even an empty one. This includes a first run that finds no issues at all, so the next run reviews from the last commit that did get a review (or the whole PR, if none did).
 
 To ignore earlier reviews and review the whole PR again, add `--full`. Findings that are already posted are still skipped:
@@ -317,7 +346,7 @@ To ignore earlier reviews and review the whole PR again, add `--full`. Findings 
 npm run review -- https://github.com/owner/repo/pull/12 --full
 ```
 
-`--dry-run` prints all of this too: which commit it would diff from, whether it fell back to a full review, how many findings it skipped, and the review it would post.
+`--dry-run` prints all of this too: which commit it would diff from, whether it fell back to a full review, how many findings it skipped, the review it would post and its event (`COMMENT` or `REQUEST_CHANGES`), and any earlier change request it would [dismiss](#how-a-change-request-is-cleared).
 
 Known limits: matching is by line number, so a finding whose code moved is posted again on its new line. If the base branch was merged into the PR, the incremental diff includes those changes in files the PR also touches. Findings that went into an earlier review's summary (lines outside the diff, or over the inline limit) are not checked for duplicates.
 
@@ -414,8 +443,9 @@ Then add the API key as a secret: in the repo, go to **Settings → Secrets and 
 Every time a PR is opened, gets new commits, is reopened or is marked ready for review, the action reviews it and posts a review just like the CLI does, including [reviewing only the new commits](#running-it-again-on-the-same-pr). Drafts are skipped. On top of that:
 
 - The full Markdown report appears on the run's summary page.
-- Each finding is also an annotation: `security` and `bug` as errors, `performance` and `suggestion` as warnings. They show on the run page and next to the code in the PR's **Files changed** tab.
+- Each finding is also an annotation: `security` and `bug` as errors, `performance` and `suggestion` as warnings. They show on the run page and next to the code in the PR's **Files changed** tab. A multi-line finding's annotation spans its lines.
 - With `fail-on`, the check fails when a finding of a listed severity is still in the PR (see [Fail on certain findings](#fail-on-certain-findings)).
+- With `request-changes-on`, the review requests changes when a new finding has a listed severity, and reviewbuddy dismisses that review once it no longer applies (see [Blocking merges](#blocking-merges)).
 
 No checkout step is needed: the action downloads the PR's diff and the changed files from the GitHub API. The `contents: read` permission in the example workflow covers the files.
 
@@ -425,6 +455,7 @@ No checkout step is needed: the action downloads the PR's diff and the changed f
 | `api-key` | none | API key for that provider; pass it from a secret |
 | `model` | the provider's default | Model to use, like that provider's `*_MODEL` variable |
 | `fail-on` | none | Comma-separated severities that fail the check, like `--fail-on` |
+| `request-changes-on` | none (comment only) | Comma-separated severities that make the review request changes, like `--request-changes-on`. It never approves |
 | `min-severity` | none (report everything) | Least serious severity to report: `security`, `bug`, `performance` or `suggestion`, like `--min-severity` |
 | `ignore` | none | Extra comma-separated file patterns to skip, like `--ignore` |
 | `full` | `false` | `true` reviews the whole PR every time, like `--full` |
@@ -434,7 +465,7 @@ No checkout step is needed: the action downloads the PR's diff and the changed f
 | `max-chunks-per-file` | `10` | Review at most this many pieces of one file (`0` = no limit), like `--max-chunks-per-file` |
 | `config` | `true` | `false` ignores the repo's `.reviewbuddy.json` and `.reviewbuddy.md`, like `--no-config` |
 | `sarif-file` | none | Also write the findings as SARIF to this path, for [Code Scanning](#upload-findings-to-code-scanning). Implies `full` |
-| `github-token` | `${{ github.token }}` | Token used to read the PR and post the review |
+| `github-token` | `${{ github.token }}` | Token used to read the PR, post the review and dismiss reviewbuddy's own outdated change requests. Needs `pull-requests: write` |
 
 The action has one output, `sarif-file`: the SARIF file's path when `sarif-file` was set and the file was written, empty otherwise.
 
@@ -450,6 +481,8 @@ GitHub doesn't give workflows on pull requests from forks any secrets, and their
 - **A key is available but the token is read-only:** the review runs and the findings appear in the run's summary and annotations, but the review can't be posted on the PR. The action warns about that instead of failing; `fail-on` still applies.
 
 ### Block merging on findings
+
+This makes the check fail. For blocking through the review instead, and how the two compare, see [Blocking merges](#blocking-merges).
 
 1. Set `fail-on` in the workflow, for example `fail-on: security,bug`.
 2. Let the workflow run once on a PR, so GitHub knows the check.
@@ -503,6 +536,55 @@ jobs:
 
 The CLI writes the same file locally with `--format sarif` or `-o results.sarif`, for VS Code's SARIF Viewer or any other SARIF tool.
 
+## Blocking merges
+
+reviewbuddy has two ways to keep a PR with serious findings from being merged. Both are off by default, and you can use either or both.
+
+| | `--request-changes-on` | `--fail-on` |
+|-|------------------------|-------------|
+| What it does | Posts the review as **Request changes** instead of a comment when a new finding has a listed severity | Exits with code 1, a failed check, while a finding of a listed severity is still in the PR |
+| What blocks the merge | Branch protection (or a ruleset) with **Require a pull request before merging** and required approvals: a change request blocks until it is dismissed | Branch protection (or a ruleset) with **Require status checks to pass**, choosing the `review` check |
+| Clears when | reviewbuddy dismisses its change request ([rule below](#how-a-change-request-is-cleared)), or someone with write access dismisses it | A later run finds no open finding of those severities |
+| With the Actions token | GitHub doesn't clearly document whether a change request from `github-actions[bot]` counts toward review requirements. Check it on your repo, or post with a GitHub App or machine-user token | Reliable: a required check doesn't depend on who ran it |
+
+Which to use:
+
+- **`fail-on` with a required status check** is the dependable gate. Use it when a finding must stop the merge.
+- **`request-changes-on`** marks the PR **Changes requested** with the findings at the top, in the PR list and for every reviewer. Use it as a strong signal, or as the gate when the reviewing account's reviews count toward your rules.
+- **Both**, for example `request-changes-on: security,bug` with `fail-on: security`, give a visible review and a hard check.
+
+reviewbuddy **never approves** a PR: it can point out problems, but finding none doesn't prove the code is right.
+
+```yaml
+      - uses: fernandesnaycaden-debug/reviewbuddy@v1
+        with:
+          provider: groq
+          api-key: ${{ secrets.GROQ_API_KEY }}
+          request-changes-on: security,bug
+          fail-on: security
+```
+
+The review requests changes when any finding it posts, inline or in the summary, has a listed severity. Findings that were already posted earlier don't make a new change request; the earlier one still stands.
+
+### How a change request is cleared
+
+GitHub keeps a change request blocking until it is dismissed, even after the code is fixed ("Dismiss stale pull request approvals" only covers approvals). So whenever `--request-changes-on` is set, each run looks for reviewbuddy's own earlier reviews (by the hidden marker) that are still **Changes requested**, and dismisses one, with a short message, when it no longer applies:
+
+1. **Nothing is dismissed** if this run found a finding of a listed severity (new, or posted before and found again), or a file couldn't be reviewed.
+2. After a **`--full` run** that reviewed every file and found no blocking issue, every earlier change request is dismissed.
+3. **Otherwise** a change request is dismissed only if every blocking inline comment it posted is now outdated (GitHub reports no current line for a comment whose code changed) and its summary lists no blocking finding. Findings listed only in the summary (outside the diff, or over the inline limit) can't be tracked, so such a review keeps blocking until a `--full` run.
+
+When in doubt it keeps blocking: a stale block is easier to clear by hand than a wrong "all clear". A kept one is reported as `Keeping 1 earlier change request by reviewbuddy`. Resolving a conversation doesn't count; changing the code under it does. Only reviews with the marker are touched, never a person's. Without `--request-changes-on` nothing is dismissed, so after turning it off, dismiss old change requests by hand.
+
+`--dry-run` prints the event the review would use, and `Would dismiss reviewbuddy's change request #...` instead of dismissing anything.
+
+### Permissions for blocking
+
+- **GitHub Actions:** `permissions: pull-requests: write`, as in the example workflow, covers requesting changes and dismissing the review. On a fork PR the token is read-only: the review isn't posted (see [Pull requests from forks](#pull-requests-from-forks)), and a dismissal only prints a warning.
+- **Fine-grained token:** Pull requests → **Read and write**. GitHub requires write for both creating a review and dismissing one.
+- **Protected branches:** with **Restrict who can dismiss pull request reviews**, only admins and the people, teams or apps on that list can dismiss. Add the token's user or app, or dismiss by hand. reviewbuddy warns (`Could not dismiss reviewbuddy's earlier change request ...`) and carries on; the run doesn't fail.
+- **Your own PR:** GitHub doesn't let anyone request changes on their own PR. When you run reviewbuddy locally with your token on your own PR, it posts the review as a comment instead and warns. In Actions the token is the bot's, so this doesn't come up.
+
 ## Configure per repository
 
 A repository that gets reviewed can carry its own settings and review rules in two files at its root:
@@ -521,6 +603,7 @@ Both are optional, and a missing file is not an error. [examples/](examples/) ha
   "ignore": ["src/generated/", "*.pb.js", "fixtures/"],
   "minSeverity": "bug",
   "failOn": ["security", "bug"],
+  "requestChangesOn": ["security"],
   "timeout": 120
 }
 ```
@@ -533,6 +616,7 @@ Both are optional, and a missing file is not an error. [examples/](examples/) ha
 | `defaultIgnore` | boolean | `--no-default-ignore` | `false` stops skipping lockfiles, `dist/` etc. by default |
 | `minSeverity` | string | `--min-severity`, `REVIEWBUDDY_MIN_SEVERITY` | Least serious severity to report |
 | `failOn` | array of strings | `--fail-on`, `REVIEWBUDDY_FAIL_ON` | Severities that make the run exit with code 1 (fail the check) |
+| `requestChangesOn` | array of strings | `--request-changes-on`, `REVIEWBUDDY_REQUEST_CHANGES_ON` | Severities that make a PR review request changes; see [Blocking merges](#blocking-merges) |
 | `timeout` | number | `--timeout`, `REVIEWBUDDY_TIMEOUT` | Seconds a single model request may take, `0` for no limit |
 | `format` | string | `--format`, `REVIEWBUDDY_FORMAT` | `text`, `json` or `sarif`; see [Output formats](#output-formats) |
 | `output` | string | `--output`, `REVIEWBUDDY_OUTPUT` | Output file path (e.g. `review-report.md`) |
@@ -601,9 +685,10 @@ These variables override the reviewed repo's [`.reviewbuddy.json`](#configure-pe
 | `GEMINI_MODEL` | `gemini-3.8-flash`       | Gemini model to use        |
 | `ANTHROPIC_API_KEY` | none                | Anthropic API key          |
 | `ANTHROPIC_MODEL` | `claude-opus-5-5`     | Claude model to use        |
-| `GITHUB_TOKEN` | none                     | Token used to read PRs and post reviews |
+| `GITHUB_TOKEN` | none                     | Token used to read PRs, post reviews and dismiss reviewbuddy's own outdated change requests |
 | `REVIEWBUDDY_IGNORE` | none               | Extra comma-separated patterns to skip, like `--ignore` |
 | `REVIEWBUDDY_FAIL_ON` | none              | Comma-separated severities that make the run exit with code 1, like `--fail-on` |
+| `REVIEWBUDDY_REQUEST_CHANGES_ON` | none (comment only) | Comma-separated severities that make a PR review request changes, like `--request-changes-on` |
 | `REVIEWBUDDY_MIN_SEVERITY` | none (report everything) | Least serious severity to report (`security` > `bug` > `performance` > `suggestion`), like `--min-severity` |
 | `REVIEWBUDDY_TIMEOUT` | `600` (Ollama), `300` (cloud) | Seconds a single model request may take, like `--timeout`. `0` means no limit |
 | `REVIEWBUDDY_FORMAT` | `text` (or from `--output`'s extension) | `text`, `json` or `sarif`, like `--format` |
@@ -625,6 +710,7 @@ Pass `--timeout <seconds>` to override `REVIEWBUDDY_TIMEOUT` for one run, for ex
 | `--concurrency <n>` | Review up to n files at once; see [Large pull requests](#large-pull-requests) |
 | `--max-files <n>` | Review at most n files, source files and the biggest changes first |
 | `--max-chunks-per-file <n>` | Review at most the first n pieces of any one file (`0` = no limit) |
+| `--request-changes-on <severities>` | On a PR, request changes instead of commenting when a posted finding has one of these severities; see [Blocking merges](#blocking-merges) |
 
 With the default Claude models (Opus 5.5, Sonnet 5.5, Opus 5, Fable 5.1), reviewbuddy turns on Anthropic's server-side refusal fallback. If a safety classifier declines to review a piece of code, another Claude model finishes the request. A piece that is still declined, or that Gemini blocks, is skipped with a warning.
 
@@ -636,7 +722,7 @@ Network errors and HTTP 429/5xx responses from GitHub, Ollama and the cloud prov
 npm test
 ```
 
-The tests cover diff parsing, line numbering, chunking, the ignore list, reply parsing, full-file context (the full file, the windows around each hunk, the budget cutoff, files that don't match the diff, fetching files at the head commit, `--repo-dir` and paths outside it), `--min-severity` and how it interacts with `--fail-on`, suggested fixes (parsing, validation, indentation, the suggestion block in posted comments, the report's Fix line), each provider's prompt budget, retries and timeouts, the GitHub client (including pagination and compare diffs), large pull requests (the HTTP 406 fallback to the files API with pagination, files without a patch, the 3,000-file note, building per-file diffs from patches with the same line numbers as from a diff, the compare API fallback and its 300-file cap, the worker pool's limit, ordering and error isolation, output kept in file order while files finish out of order, a failing file not losing the others, errors that stop the run, `Retry-After` and the pause shared across requests to one host, each provider's default concurrency, `--max-files` ordering and the 50-comment inline cap), review markers and skipping findings already posted, re-runs (same commit, new commits, force-push fallback, `--full`), splitting findings between inline comments and the review body, the Markdown report, `--fail-on` and exit codes, GitHub Actions annotations (and their escaping), the job summary, fork PRs without a key or with a read-only token, a full run with GitHub and Ollama mocked, per-repository config (validation, secret rejection, unknown keys, which value wins for each setting, ignore-pattern merging, finding the files up to the git root, reading them from the PR's base commit, `--no-config`, the rules cap and its effect on the context budget, and the prompt staying unchanged without rules), each cloud provider's requests, replies and errors (provider selection, missing keys, schema fallback, 401/404/429), the git flags (the git arguments for each mode, rejecting revisions that start with `-`, missing git, not a repository, unknown revisions, nothing to review, and, in temporary git repositories, that each mode reads its context from the index, the working tree or HEAD), reading stdin, UTF-8 byte order marks and UTF-16 diffs, choosing the format from `--format` or the extension, stdout holding only the document in JSON and SARIF modes (checked by running the CLI in a child process), the JSON document's shape, and the SARIF log's structure and level mapping (checked by hand against the essentials of the 2.1.0 schema). They need neither Ollama, API keys nor network access; the git tests are skipped if git isn't installed.
+The tests cover diff parsing, line numbering, chunking, the ignore list, reply parsing, full-file context (the full file, the windows around each hunk, the budget cutoff, files that don't match the diff, fetching files at the head commit, `--repo-dir` and paths outside it), `--min-severity` and how it interacts with `--fail-on`, suggested fixes (parsing, validation, indentation, the suggestion block in posted comments, the report's Fix line), multi-line findings (`endLine` parsing, the 20-line cap, the same-hunk rule, `start_line`/`line` in posted comments, block suggestions and their indentation, re-runs not posting a range again, ranges in every output format), requesting changes (the event choice, never approving, the own-PR fallback, the dismissal rule, a refused dismissal, `--dry-run`), each provider's prompt budget, retries and timeouts, the GitHub client (including pagination and compare diffs), large pull requests (the HTTP 406 fallback to the files API with pagination, files without a patch, the 3,000-file note, building per-file diffs from patches with the same line numbers as from a diff, the compare API fallback and its 300-file cap, the worker pool's limit, ordering and error isolation, output kept in file order while files finish out of order, a failing file not losing the others, errors that stop the run, `Retry-After` and the pause shared across requests to one host, each provider's default concurrency, `--max-files` ordering and the 50-comment inline cap), review markers and skipping findings already posted, re-runs (same commit, new commits, force-push fallback, `--full`), splitting findings between inline comments and the review body, the Markdown report, `--fail-on` and exit codes, GitHub Actions annotations (and their escaping), the job summary, fork PRs without a key or with a read-only token, a full run with GitHub and Ollama mocked, per-repository config (validation, secret rejection, unknown keys, which value wins for each setting, ignore-pattern merging, finding the files up to the git root, reading them from the PR's base commit, `--no-config`, the rules cap and its effect on the context budget, and the prompt staying unchanged without rules), each cloud provider's requests, replies and errors (provider selection, missing keys, schema fallback, 401/404/429), the git flags (the git arguments for each mode, rejecting revisions that start with `-`, missing git, not a repository, unknown revisions, nothing to review, and, in temporary git repositories, that each mode reads its context from the index, the working tree or HEAD), reading stdin, UTF-8 byte order marks and UTF-16 diffs, choosing the format from `--format` or the extension, stdout holding only the document in JSON and SARIF modes (checked by running the CLI in a child process), the JSON document's shape, and the SARIF log's structure and level mapping (checked by hand against the essentials of the 2.1.0 schema). They need neither Ollama, API keys nor network access; the git tests are skipped if git isn't installed.
 
 ## Expected output
 
@@ -715,7 +801,12 @@ The first run can't see `getUser`, so models often flag line 41 as a possible nu
 | `No new findings to post.` | Not an error: the new commits had no issues, or every finding was already posted. Nothing was posted. |
 | `Unknown severity "..." in --fail-on` | Use only `bug`, `security`, `performance` and `suggestion`, separated by commas, in `--fail-on`, `REVIEWBUDDY_FAIL_ON` or the action's `fail-on` input. |
 | `Unknown severity "..." in --min-severity` | Use exactly one of `security`, `bug`, `performance` or `suggestion` in `--min-severity`, `REVIEWBUDDY_MIN_SEVERITY` or the action's `min-severity` input. |
-| `--fail-on ... has no effect with --min-severity ...` | Only a warning: those findings are left out before `--fail-on` sees them. Lower `--min-severity` or drop them from `--fail-on`. |
+| `--fail-on ... has no effect with --min-severity ...` | Only a warning: those findings are left out before `--fail-on` sees them. Lower `--min-severity` or drop them from `--fail-on`. The same goes for `--request-changes-on`. |
+| `Unknown severity "..." in --request-changes-on` | Use only `bug`, `security`, `performance` and `suggestion`, separated by commas, as for `--fail-on`. |
+| `GitHub doesn't let anyone request changes on their own pull request ... posted as a comment instead` | Only a warning: the token belongs to the PR's author. Use another account's token, or let the action review the PR. |
+| `Could not dismiss reviewbuddy's earlier change request #...` | Only a warning: that change request still blocks. Give the token Pull requests: Read and write. With "Restrict who can dismiss pull request reviews", add its user or app to the list, or dismiss the review by hand. |
+| `Keeping 1 earlier change request by reviewbuddy` | Not an error: a blocking finding is still in the code, or was listed only in the review summary. Fix it, run once with `--full` to re-check everything, or dismiss the review by hand. See [How a change request is cleared](#how-a-change-request-is-cleared). |
+| The PR still shows **Changes requested** after turning `request-changes-on` off | reviewbuddy only dismisses its reviews while the setting is on. Dismiss the old review by hand: on the review, **...** → **Dismiss review**. |
 | `Could not fetch ... for context ... The token needs "Contents: Read"` | Only a warning: that file is reviewed from the diff alone. Give the token Contents → Read access. |
 | `... doesn't match the diff (another version checked out?)` | Only a warning: the local file isn't the diff's new version. Check out the branch the diff came from, or point `--repo-dir` at it. |
 | `--repo-dir ... is not a directory` | Check the path passed to `--repo-dir`. |

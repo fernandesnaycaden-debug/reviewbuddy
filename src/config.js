@@ -52,10 +52,10 @@ const FIELDS = {
     return { minSeverity: value.toLowerCase() };
   },
   failOn(value, where) {
-    if (!Array.isArray(value) || !value.every((s) => typeof s === 'string' && SEVERITIES.includes(s.toLowerCase()))) {
-      throw new Error(`${where} must be an array of severities (${SEVERITIES.join(', ')}), like ["security", "bug"].`);
-    }
-    return { failOn: [...new Set(value.map((s) => s.toLowerCase()))] };
+    return { failOn: severityList(value, where) };
+  },
+  requestChangesOn(value, where) {
+    return { requestChangesOn: severityList(value, where) };
   },
   timeout(value, where) {
     if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
@@ -84,6 +84,14 @@ const FIELDS = {
   },
 };
 
+/** A .reviewbuddy.json value that must be an array of severities, returned lower case without repeats. */
+function severityList(value, where) {
+  if (!Array.isArray(value) || !value.every((s) => typeof s === 'string' && SEVERITIES.includes(s.toLowerCase()))) {
+    throw new Error(`${where} must be an array of severities (${SEVERITIES.join(', ')}), like ["security", "bug"].`);
+  }
+  return [...new Set(value.map((s) => s.toLowerCase()))];
+}
+
 /** A .reviewbuddy.json value that must be a whole number from min to max. */
 function countField(value, where, { min = 0, max = Infinity }) {
   if (!Number.isInteger(value) || value < min || value > max) {
@@ -94,7 +102,7 @@ function countField(value, where, { min = 0, max = Infinity }) {
 
 /**
  * Parse and validate .reviewbuddy.json. label names the file in errors.
- * Returns { provider?, model?, ignore?, defaultIgnore?, minSeverity?, failOn?, timeoutMs?, format?,
+ * Returns { provider?, model?, ignore?, defaultIgnore?, minSeverity?, failOn?, requestChangesOn?, timeoutMs?, format?,
  * concurrency?, maxFiles?, maxChunksPerFile? }.
  * Unknown keys are warned about and skipped; anything that looks like a secret is an error.
  */
@@ -247,6 +255,7 @@ export function resolveSettings({ flags = {}, env = {}, file = {} }) {
   const providerSource = cliProvider ? cliProvider.label : file.provider ? CONFIG_FILE : 'default';
 
   const failOn = given(flags, env, 'fail-on', 'REVIEWBUDDY_FAIL_ON');
+  const requestChangesOn = given(flags, env, 'request-changes-on', 'REVIEWBUDDY_REQUEST_CHANGES_ON');
   const minSeverity = given(flags, env, 'min-severity', 'REVIEWBUDDY_MIN_SEVERITY');
   const timeout = given(flags, env, 'timeout', 'REVIEWBUDDY_TIMEOUT');
   const format = given(flags, env, 'format', 'REVIEWBUDDY_FORMAT');
@@ -261,6 +270,10 @@ export function resolveSettings({ flags = {}, env = {}, file = {} }) {
     providerSource,
     model: resolveModel(provider, providerSource, env, file),
     failOn: failOn ? parseFailOn(failOn.value, failOn.label) : file.failOn ?? [],
+    // []: comment only, never request changes.
+    requestChangesOn: requestChangesOn
+      ? parseFailOn(requestChangesOn.value, requestChangesOn.label)
+      : file.requestChangesOn ?? [],
     minSeverity: minSeverity ? parseMinSeverity(minSeverity.value, minSeverity.label) : file.minSeverity,
     timeoutMs: timeout ? parseTimeout(timeout.value, timeout.label) : file.timeoutMs,
     // undefined: --output's extension decides, else text.
@@ -305,7 +318,10 @@ function resolveModel(provider, providerSource, env, file) {
   return undefined;
 }
 
-/** Severities from a comma-separated list ("security,bug"). [] means never fail. label names the source in errors. */
+/**
+ * Severities from a comma-separated list ("security,bug"), for --fail-on and --request-changes-on.
+ * [] means never fail (or never request changes). label names the source in errors.
+ */
 export function parseFailOn(value, label = '--fail-on') {
   if (!value) return [];
   const wanted = value.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
