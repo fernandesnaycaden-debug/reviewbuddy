@@ -12,7 +12,7 @@
     "samples"
   ],
   "scripts": {
-    "review": "node bin/reviewbuddy.js",
+    "review": "node bin/reviewbuddy.js -o review.md",
     "test": "node --test"
   },
   "repository": {

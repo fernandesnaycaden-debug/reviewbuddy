@@ -82,7 +82,7 @@ async function run(argv) {
   // Check flags and variables now, before any request. A provider they name wins over the
   // repo's config, so an unknown one or a missing API key fails here too.
   const early = resolveSettings({ flags, env: process.env });
-  routeLogs(early.format, flags.output);
+  routeLogs(early.format, early.output);
   if (early.providerSource !== 'default' && await selectProvider(early.provider) === SKIPPED) return;
 
   const token = process.env.GITHUB_TOKEN;
@@ -97,11 +97,11 @@ async function run(argv) {
   const config = await repoConfig(flags['no-config'], pr, token, details, repoDir);
   const settings = resolveSettings({ flags, env: process.env, file: config.file });
   // The repo's config can set the format too.
-  routeLogs(settings.format, flags.output);
+  routeLogs(settings.format, settings.output);
   if (config.summary) info(config.summary);
 
   const { failOn, minSeverity } = settings;
-  const format = outputFormat(settings.format, flags.output);
+  const format = outputFormat(settings.format, settings.output);
   const unreachable = failOn.filter((s) => !atLeast(s, minSeverity));
   if (unreachable.length > 0) {
     warn(`Warning: --fail-on ${unreachable.join(',')} has no effect with --min-severity ${minSeverity}, which leaves those findings out.`);
@@ -130,7 +130,7 @@ async function run(argv) {
     ? await reviewPullRequest(pr, token, details, options)
     : await reviewLocal(input, options);
   await writeOutput(results, {
-    format, output: flags.output, seconds, notReviewed,
+    format, output: settings.output, seconds, notReviewed,
   });
   checkFailOn(findings, failOn);
   checkFailed(notReviewed);

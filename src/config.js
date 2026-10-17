@@ -78,6 +78,10 @@ const FIELDS = {
     }
     return { format: value.toLowerCase() };
   },
+  output(value, where) {
+    if (typeof value !== 'string' || !value.trim()) throw new Error(`${where} must be a file path.`);
+    return { output: value.trim() };
+  },
 };
 
 /** A .reviewbuddy.json value that must be a whole number from min to max. */
@@ -246,6 +250,7 @@ export function resolveSettings({ flags = {}, env = {}, file = {} }) {
   const minSeverity = given(flags, env, 'min-severity', 'REVIEWBUDDY_MIN_SEVERITY');
   const timeout = given(flags, env, 'timeout', 'REVIEWBUDDY_TIMEOUT');
   const format = given(flags, env, 'format', 'REVIEWBUDDY_FORMAT');
+  const output = given(flags, env, 'output', 'REVIEWBUDDY_OUTPUT');
   const concurrency = given(flags, env, 'concurrency', 'REVIEWBUDDY_CONCURRENCY');
   const maxFiles = given(flags, env, 'max-files', 'REVIEWBUDDY_MAX_FILES');
   const maxChunks = given(flags, env, 'max-chunks-per-file', 'REVIEWBUDDY_MAX_CHUNKS_PER_FILE');
@@ -260,6 +265,7 @@ export function resolveSettings({ flags = {}, env = {}, file = {} }) {
     timeoutMs: timeout ? parseTimeout(timeout.value, timeout.label) : file.timeoutMs,
     // undefined: --output's extension decides, else text.
     format: format ? parseFormat(format.value, format.label) : file.format,
+    output: output ? output.value : file.output,
     // undefined: the provider's default (see defaultConcurrency).
     concurrency: concurrency ? parseCount(concurrency.value, concurrency.label, { min: 1, max: MAX_CONCURRENCY }) : file.concurrency,
     // 0: no limit.

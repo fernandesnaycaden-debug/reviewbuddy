@@ -910,6 +910,15 @@ test('REVIEWBUDDY_FORMAT works like --format', () => withEnv({ OLLAMA_URL: 'http
   assert.equal(JSON.parse(await readFile(join(dir, 'out.json'), 'utf8')).version, '2.1.0');
 }));
 
+test('REVIEWBUDDY_OUTPUT works like --output', () => withEnv({ OLLAMA_URL: 'http://ollama.test', REVIEWBUDDY_OUTPUT: join(dir, 'report.md') }, async () => {
+  fakeOllama([{ line: 2, severity: 'bug', message: 'Unused key', suggestion: '' }]);
+  await writeFile(join(dir, 'changes.diff'), diff);
+
+  await main([join(dir, 'changes.diff')]);
+
+  assert.match(await readFile(join(dir, 'report.md'), 'utf8'), /^# 🔍 ReviewBuddy Report/);
+}));
+
 test('--min-severity and --fail-on apply the same way with --format sarif', () => withEnv({ OLLAMA_URL: 'http://ollama.test' }, async () => {
   fakeOllama(mixed);
   await writeFile(join(dir, 'changes.diff'), diff);

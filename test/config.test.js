@@ -101,13 +101,19 @@ test('parseConfig refuses anything that looks like a secret, and says where secr
 
 test('parseConfig warns about unknown keys and still uses the rest', () => {
   assert.deepEqual(parseConfig('{"minSeverity": "bug", "severity": "bug"}'), { minSeverity: 'bug' });
-  assert.match(warned(), /Warning: unknown key "severity" in \.reviewbuddy\.json, ignoring it\. Known keys: provider, model, ignore, defaultIgnore, minSeverity, failOn, timeout, concurrency, maxFiles, maxChunksPerFile, format\./);
+  assert.match(warned(), /Warning: unknown key "severity" in \.reviewbuddy\.json, ignoring it\. Known keys: provider, model, ignore, defaultIgnore, minSeverity, failOn, timeout, concurrency, maxFiles, maxChunksPerFile, format, output\./);
 });
 
 test('parseConfig reads "format" in any case and rejects unknown ones', () => {
   assert.deepEqual(parseConfig('{"format": "SARIF"}'), { format: 'sarif' });
   assert.throws(() => parseConfig('{"format": "xml"}'), /"format" in \.reviewbuddy\.json must be one of: text, json, sarif\./);
   assert.throws(() => parseConfig('{"format": 1}'), /"format" in \.reviewbuddy\.json must be one of/);
+});
+
+test('parseConfig reads "output" and rejects non-strings', () => {
+  assert.deepEqual(parseConfig('{"output": "report.md"}'), { output: 'report.md' });
+  assert.throws(() => parseConfig('{"output": ""}'), /"output" in \.reviewbuddy\.json must be a file path\./);
+  assert.throws(() => parseConfig('{"output": 123}'), /"output" in \.reviewbuddy\.json must be a file path\./);
 });
 
 // .reviewbuddy.md
@@ -151,6 +157,7 @@ test('resolveSettings uses the built-in defaults when nothing is set', () => {
     minSeverity: undefined,
     timeoutMs: undefined,
     format: undefined,
+    output: undefined,
     concurrency: undefined,
     maxFiles: 0,
     maxChunksPerFile: 10,
@@ -167,6 +174,14 @@ test('resolveSettings takes the format from a flag, then a variable, then the fi
   assert.equal(resolveSettings({ env: { REVIEWBUDDY_FORMAT: '' }, file: fromFile }).format, 'json');
   assert.throws(() => resolveSettings({ env: { REVIEWBUDDY_FORMAT: 'xml' } }), /Unknown format "xml" in REVIEWBUDDY_FORMAT\. Use one of: text, json, sarif\./);
   assert.throws(() => resolveSettings({ flags: { format: 'md' } }), /Unknown format "md" in --format\./);
+});
+
+test('resolveSettings takes the output from a flag, then a variable, then the file', () => {
+  const fromFile = { output: 'file.md' };
+  assert.equal(resolveSettings({ file: fromFile }).output, 'file.md');
+  assert.equal(resolveSettings({ env: { REVIEWBUDDY_OUTPUT: 'env.md' }, file: fromFile }).output, 'env.md');
+  assert.equal(resolveSettings({ flags: { output: 'flag.md' }, env: { REVIEWBUDDY_OUTPUT: 'env.md' }, file: fromFile }).output, 'flag.md');
+  assert.equal(resolveSettings({ env: { REVIEWBUDDY_OUTPUT: '' }, file: fromFile }).output, 'file.md');
 });
 
 test('resolveSettings takes each setting from the file over the defaults', () => {

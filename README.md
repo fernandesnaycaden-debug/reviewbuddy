@@ -535,6 +535,7 @@ Both are optional, and a missing file is not an error. [examples/](examples/) ha
 | `failOn` | array of strings | `--fail-on`, `REVIEWBUDDY_FAIL_ON` | Severities that make the run exit with code 1 (fail the check) |
 | `timeout` | number | `--timeout`, `REVIEWBUDDY_TIMEOUT` | Seconds a single model request may take, `0` for no limit |
 | `format` | string | `--format`, `REVIEWBUDDY_FORMAT` | `text`, `json` or `sarif`; see [Output formats](#output-formats) |
+| `output` | string | `--output`, `REVIEWBUDDY_OUTPUT` | Output file path (e.g. `review-report.md`) |
 | `concurrency` | whole number, 1 to 16 | `--concurrency`, `REVIEWBUDDY_CONCURRENCY` | Files to review at once; see [Large pull requests](#large-pull-requests) |
 | `maxFiles` | whole number | `--max-files`, `REVIEWBUDDY_MAX_FILES` | Review at most this many files, `0` for no limit |
 | `maxChunksPerFile` | whole number | `--max-chunks-per-file`, `REVIEWBUDDY_MAX_CHUNKS_PER_FILE` | Review at most this many pieces of one file, `0` for no limit |
@@ -606,6 +607,7 @@ These variables override the reviewed repo's [`.reviewbuddy.json`](#configure-pe
 | `REVIEWBUDDY_MIN_SEVERITY` | none (report everything) | Least serious severity to report (`security` > `bug` > `performance` > `suggestion`), like `--min-severity` |
 | `REVIEWBUDDY_TIMEOUT` | `600` (Ollama), `300` (cloud) | Seconds a single model request may take, like `--timeout`. `0` means no limit |
 | `REVIEWBUDDY_FORMAT` | `text` (or from `--output`'s extension) | `text`, `json` or `sarif`, like `--format` |
+| `REVIEWBUDDY_OUTPUT` | none (or `review-report.md` via `npm run review`) | Write results to a file, like `--output` |
 | `REVIEWBUDDY_CONCURRENCY` | `1` (Ollama), `2` (Groq, OpenRouter), `4` (Gemini, Anthropic) | Files to review at once, 1 to 16, like `--concurrency` |
 | `REVIEWBUDDY_MAX_FILES` | none (no limit) | Review at most this many files, like `--max-files` |
 | `REVIEWBUDDY_MAX_CHUNKS_PER_FILE` | `10` | Review at most this many pieces of one file, like `--max-chunks-per-file`. `0` means no limit |
