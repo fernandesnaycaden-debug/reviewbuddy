@@ -19,9 +19,21 @@
     "type": "git",
     "url": "git+https://github.com/fernandesnaycaden-debug/reviewbuddy.git"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "code-review",
+    "ai",
+    "llm",
+    "github-action",
+    "pull-request",
+    "ollama",
+    "groq",
+    "gemini",
+    "anthropic",
+    "sarif",
+    "cli"
+  ],
+  "author": "Nay Caden Fernandes",
+  "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=18"
