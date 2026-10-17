@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, mock, test } from 'node:test';
 import { markerFor } from '../src/dedupe.js';
 import {
-  buildReview, formatReport, main, parseFailOn, parseMinSeverity, readStdin, selectInput, writeReport,
+  buildReview, formatReport, main, parseFailOn, parseMinSeverity, readStdin, reviewEvent, selectInput, writeReport,
 } from '../src/index.js';
 import { SYSTEM_PROMPT } from '../src/review.js';
 
@@ -157,6 +157,7 @@ function withEnv(vars, fn) {
   vars = {
     REVIEWBUDDY_PROVIDER: '',
     REVIEWBUDDY_FAIL_ON: '',
+    REVIEWBUDDY_REQUEST_CHANGES_ON: '',
     REVIEWBUDDY_MIN_SEVERITY: '',
     REVIEWBUDDY_IGNORE: '',
     REVIEWBUDDY_TIMEOUT: '',
@@ -215,15 +216,18 @@ const SOURCE = "const a = 1;\nconst key = 'secret';\nexport { a };\n";
  * lists, changedFiles the PR's changed_files count. compareStatus and compareFiles do the same for the compare API.
  * findings may be a function of the reviewed file's name. ollamaStatus(filename) answers that file's model request
  * with an error status instead; delay(filename) holds its reply back that many ms.
- * Returns the posted review bodies, the requested URLs, and the user and system prompts sent to the model.
+ * rejectRequestChanges answers a change request with GitHub's 422 for the author's own PR. dismissStatus answers
+ * dismissals with that error status.
+ * Returns the posted review bodies, every attempted review's event, the dismissals ({ url, body }), the requested URLs,
+ * and the user and system prompts sent to the model.
  */
 function fakeGitHub({
   reviews = [], comments = [], compare = compareDiff, findings = [hardcodedKey], postStatus, source = SOURCE,
   config = {}, headConfig = {}, diffStatus, prFiles = [], changedFiles, compareStatus, compareFiles = [],
-  ollamaStatus = () => undefined, delay = () => 0,
+  ollamaStatus = () => undefined, delay = () => 0, rejectRequestChanges = false, dismissStatus,
 } = {}) {
   const calls = {
-    posted: [], urls: [], reviewed: [], systems: [],
+    posted: [], events: [], dismissed: [], urls: [], reviewed: [], systems: [],
   };
   mock.method(globalThis, 'fetch', async (url, init) => {
     calls.urls.push(url);
@@ -238,7 +242,17 @@ function fakeGitHub({
       return ollamaReply(typeof findings === 'function' ? findings(filename) : findings);
     }
     const path = url.replace('https://api.github.com/repos/o/r/', '');
+    if (init.method === 'PUT') {
+      if (dismissStatus) return Response.json({ message: 'Resource not accessible by integration' }, { status: dismissStatus });
+      calls.dismissed.push({ url, body: JSON.parse(init.body) });
+      return Response.json({ state: 'DISMISSED' });
+    }
     if (init.method === 'POST') {
+      const { event } = JSON.parse(init.body);
+      calls.events.push(event);
+      if (rejectRequestChanges && event === 'REQUEST_CHANGES') {
+        return Response.json({ message: 'Unprocessable Entity', errors: ['Review Can not request changes on your own pull request'] }, { status: 422 });
+      }
       if (postStatus) return Response.json({ message: 'Resource not accessible by integration' }, { status: postStatus });
       calls.posted.push(JSON.parse(init.body));
       return Response.json({ html_url: 'https://github.com/o/r/pull/1#review' });
@@ -1206,4 +1220,235 @@ test('the JSON and SARIF output list what wasn\'t reviewed', () => github(async 
     ['warning', 'src/d.js'],
     ['error', 'src/c.js'],
   ]);
+}));
+
+// Multi-line findings
+
+/** Lines 2-4 (a loop) added in the first hunk, line 24 in the second. */
+const blockDiff = [
+  'diff --git a/src/a.js b/src/a.js',
+  '--- a/src/a.js',
+  '+++ b/src/a.js',
+  '@@ -1,2 +1,5 @@',
+  ' function f(xs) {',
+  '+  for (let i = 0; i <= xs.length; i++) {',
+  '+    use(xs[i]);',
+  '+  }',
+  ' }',
+  '@@ -20,1 +23,2 @@',
+  ' x();',
+  '+y();',
+  '',
+].join('\n');
+const loopFix = '  for (let i = 0; i < xs.length; i++) {\n    use(xs[i]);\n  }';
+
+test('buildReview posts a range as start_line and line, with a suggestion for the whole block', () => {
+  const review = buildReview([{
+    filename: 'src/a.js',
+    diff: blockDiff,
+    comments: [{
+      line: 2, endLine: 4, severity: 'bug', message: 'Off-by-one', suggestion: loopFix,
+    }],
+  }], { commitId: 'abc', model: 'm' });
+  assert.deepEqual(review.comments, [{
+    path: 'src/a.js', start_line: 2, line: 4, body: `**[BUG]** Off-by-one\n\n\`\`\`suggestion\n${loopFix}\n\`\`\``,
+  }]);
+});
+
+test('buildReview posts a range the PR diff splits on its first line, and lists one outside the diff as file:a-b', () => {
+  const review = buildReview([{
+    filename: 'src/a.js',
+    diff: blockDiff,
+    comments: [
+      {
+        line: 4, endLine: 24, severity: 'bug', message: 'Split', suggestion: 'a();\nb();',
+      },
+      {
+        line: 40, endLine: 42, severity: 'security', message: 'Outside',
+      },
+    ],
+  }], { commitId: 'abc', model: 'm' });
+  assert.deepEqual(review.comments, [{ path: 'src/a.js', line: 4, body: '**[BUG]** Split' }]);
+  assert.match(review.body, /^- `src\/a\.js:40-42` \*\*\[SECURITY\]\*\* Outside$/m);
+});
+
+test('formatReport shows a range and a multi-line fix', () => {
+  const report = formatReport([{
+    filename: 'src/a.js',
+    comments: [{
+      line: 2, endLine: 4, severity: 'bug', message: 'Off-by-one', suggestion: loopFix,
+    }],
+  }], { model: 'm', seconds: '1', date: new Date(0) });
+  assert.match(report, /\| 2-4 \| 🟠 \*\*BUG\*\* \| Off-by-one<br>\*\*Fix:\*\* `for \(let i = 0; i < xs\.length; i\+\+\) \{`<br>` {2}use\(xs\[i\]\);`<br>`\}` \|/);
+});
+
+const loop = {
+  line: 2, endLine: 3, severity: 'bug', message: 'Loop', suggestion: '',
+};
+
+test('main posts a range finding on both lines, and prints it as file:a-b', () => github(async () => {
+  const calls = fakeGitHub({ findings: [loop] });
+
+  await main([PR_URL]);
+
+  assert.deepEqual(calls.posted[0].comments, [{
+    path: 'src/a.js', start_line: 2, line: 3, body: '**[BUG]** Loop', start_side: 'RIGHT', side: 'RIGHT',
+  }]);
+  assert.match(logged(), /src\/a\.js:2-3 \[BUG\] Loop/);
+}));
+
+test('main does not post a range finding again on a re-run', () => github(async () => {
+  const calls = fakeGitHub({
+    reviews: [{ id: 1, body: markerFor(OLD) }],
+    // As GitHub lists the earlier range comment: start_line is its first line, line its last.
+    comments: [{
+      pull_request_review_id: 1, path: 'src/a.js', start_line: 2, line: 3, body: '**[BUG]** Loop',
+    }],
+    findings: [loop],
+  });
+
+  await main([PR_URL]);
+
+  assert.equal(calls.posted.length, 0);
+  assert.match(logged(), /Skipped 1 finding already posted/);
+}));
+
+// Requesting changes
+
+test('reviewEvent requests changes only for a listed severity, and never approves', () => {
+  const found = [{ filename: 'a.js', comments: [{ line: 1, severity: 'bug', message: 'm' }] }];
+  assert.equal(reviewEvent(found, ['security', 'bug']), 'REQUEST_CHANGES');
+  assert.equal(reviewEvent(found, ['security']), 'COMMENT');
+  assert.equal(reviewEvent(found, []), 'COMMENT');
+  assert.equal(reviewEvent(found), 'COMMENT');
+  assert.equal(reviewEvent([], ['bug']), 'COMMENT');
+  assert.equal(reviewEvent([{ filename: 'a.js', comments: [] }], ['bug']), 'COMMENT');
+});
+
+test('main requests changes when a posted finding matches --request-changes-on, and comments otherwise', () => github(async () => {
+  const runs = [];
+  for (const args of [['--request-changes-on', 'security,bug'], ['--request-changes-on', 'bug'], []]) {
+    mock.restoreAll();
+    mock.method(console, 'log', () => {});
+    mock.method(console, 'warn', () => {});
+    const calls = fakeGitHub();
+    await main([PR_URL, ...args]);
+    runs.push(calls);
+  }
+  assert.deepEqual(runs.map((calls) => calls.posted[0].event), ['REQUEST_CHANGES', 'COMMENT', 'COMMENT']);
+  // reviewbuddy never approves, whatever it found.
+  assert.ok(!runs.flatMap((calls) => calls.events).includes('APPROVE'));
+}));
+
+test('REVIEWBUDDY_REQUEST_CHANGES_ON works like --request-changes-on', () => withEnv({
+  GITHUB_TOKEN: 'tok', OLLAMA_URL: 'http://ollama.test', REVIEWBUDDY_REQUEST_CHANGES_ON: 'security',
+}, async () => {
+  const calls = fakeGitHub();
+  await main([PR_URL]);
+  assert.equal(calls.posted[0].event, 'REQUEST_CHANGES');
+}));
+
+test('main posts a comment instead, with a warning, when GitHub refuses changes on the author\'s own PR', () => github(async () => {
+  const calls = fakeGitHub({ rejectRequestChanges: true });
+
+  await main([PR_URL, '--request-changes-on', 'security']);
+
+  assert.deepEqual(calls.events, ['REQUEST_CHANGES', 'COMMENT']);
+  assert.equal(calls.posted.length, 1);
+  assert.equal(calls.posted[0].event, 'COMMENT');
+  assert.match(warned(), /Warning: GitHub doesn't let anyone request changes on their own pull request.*posted as a comment instead/);
+  assert.notEqual(process.exitCode, 1);
+}));
+
+test('main --dry-run shows the event it would use', () => github(async () => {
+  const calls = fakeGitHub();
+  await main([PR_URL, '--dry-run', '--request-changes-on', 'security']);
+  assert.equal(calls.events.length, 0);
+  assert.match(logged(), /Dry run, not posting\. The review would be \(event REQUEST_CHANGES\):/);
+  assert.match(logged(), /"event": "REQUEST_CHANGES"/);
+}));
+
+// Dismissing our earlier change request
+
+const blockingReview = { id: 5, state: 'CHANGES_REQUESTED', body: `reviewbuddy found 1 issue.\n\n${markerFor(OLD)}` };
+const keyComment = {
+  pull_request_review_id: 5, path: 'src/a.js', line: 2, body: '**[SECURITY]** Hardcoded key',
+};
+// GitHub reports no current line on a comment whose code changed.
+const outdatedKey = { ...keyComment, line: null };
+
+test('main dismisses its change request once the blocking comments are outdated and nothing blocking is left', () => github(async () => {
+  const calls = fakeGitHub({ reviews: [blockingReview], comments: [outdatedKey], findings: [] });
+
+  await main([PR_URL, '--request-changes-on', 'security']);
+
+  assert.equal(calls.posted.length, 0);
+  assert.equal(calls.dismissed.length, 1);
+  assert.equal(calls.dismissed[0].url, 'https://api.github.com/repos/o/r/pulls/1/reviews/5/dismissals');
+  assert.deepEqual(calls.dismissed[0].body, {
+    message: 'reviewbuddy: the blocking findings were fixed (the code under them changed) and the review of abc1234 found no new ones.',
+    event: 'DISMISS',
+  });
+  assert.match(logged(), /Dismissed reviewbuddy's earlier change request #5/);
+}));
+
+test('main keeps its change request while a blocking comment still applies', () => github(async () => {
+  const calls = fakeGitHub({ reviews: [blockingReview], comments: [keyComment], findings: [] });
+
+  await main([PR_URL, '--request-changes-on', 'security']);
+
+  assert.equal(calls.dismissed.length, 0);
+  assert.match(logged(), /Keeping 1 earlier change request by reviewbuddy: not every blocking finding is fixed yet\./);
+}));
+
+test('main keeps its change request when this run finds a blocking issue', () => github(async () => {
+  const calls = fakeGitHub({ reviews: [blockingReview], comments: [outdatedKey] });
+  await main([PR_URL, '--request-changes-on', 'security']);
+  assert.equal(calls.dismissed.length, 0);
+  assert.equal(calls.posted[0].event, 'REQUEST_CHANGES');
+}));
+
+test('main keeps its change request when a file could not be reviewed', () => github(async () => {
+  const calls = fakeGitHub({
+    reviews: [blockingReview], comments: [outdatedKey], findings: [], ollamaStatus: () => 400,
+  });
+  await main([PR_URL, '--request-changes-on', 'security']);
+  assert.equal(calls.dismissed.length, 0);
+}));
+
+test('main --full dismisses its change request when the whole PR has no blocking issue', () => github(async () => {
+  const reviewed = { ...blockingReview, body: markerFor(HEAD) };
+  const calls = fakeGitHub({ reviews: [reviewed], comments: [keyComment], findings: [] });
+
+  await main([PR_URL, '--full', '--request-changes-on', 'security']);
+
+  assert.deepEqual(calls.dismissed.map((d) => d.body.message), ['reviewbuddy: a full review of abc1234 found no blocking issues.']);
+}));
+
+test('main warns, and carries on, when GitHub won\'t let it dismiss the review', () => github(async () => {
+  const calls = fakeGitHub({
+    reviews: [blockingReview], comments: [outdatedKey], findings: [], dismissStatus: 403,
+  });
+
+  await main([PR_URL, '--request-changes-on', 'security']);
+
+  assert.equal(calls.dismissed.length, 0);
+  assert.match(warned(), /Warning: Could not dismiss reviewbuddy's earlier change request #5: GitHub returned HTTP 403.*It keeps blocking the merge until someone with write access dismisses it\./);
+  assert.notEqual(process.exitCode, 1);
+}));
+
+test('main --dry-run says which change request it would dismiss, without dismissing it', () => github(async () => {
+  const calls = fakeGitHub({ reviews: [blockingReview], comments: [outdatedKey], findings: [] });
+
+  await main([PR_URL, '--dry-run', '--request-changes-on', 'security']);
+
+  assert.equal(calls.dismissed.length, 0);
+  assert.ok(!calls.urls.some((u) => u.includes('/dismissals')));
+  assert.match(logged(), /Would dismiss reviewbuddy's change request #5: reviewbuddy: the blocking findings were fixed/);
+}));
+
+test('main leaves change requests alone without --request-changes-on', () => github(async () => {
+  const calls = fakeGitHub({ reviews: [blockingReview], comments: [outdatedKey], findings: [] });
+  await main([PR_URL]);
+  assert.equal(calls.dismissed.length, 0);
 }));

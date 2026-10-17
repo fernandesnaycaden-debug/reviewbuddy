@@ -29,12 +29,14 @@ export function annotation(level, message, properties = {}) {
 
 const ERROR_SEVERITIES = new Set(['security', 'bug']);
 
-/** One annotation per finding: security and bug findings are errors, the rest warnings. */
+/** One annotation per finding: security and bug findings are errors, the rest warnings. A range sets endLine. */
 export function annotationsFor(results) {
   return results.flatMap(({ filename, comments }) => comments.map((c) => annotation(
     ERROR_SEVERITIES.has(c.severity) ? 'error' : 'warning',
     c.message,
-    { file: filename, line: c.line, title: `reviewbuddy: ${c.severity.toUpperCase()}` },
+    {
+      file: filename, line: c.line, endLine: c.endLine, title: `reviewbuddy: ${c.severity.toUpperCase()}`,
+    },
   )));
 }
 

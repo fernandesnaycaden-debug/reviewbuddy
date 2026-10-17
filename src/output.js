@@ -31,6 +31,11 @@ export function outputFormat(format, outputPath) {
   return BY_EXTENSION[extname(outputPath).toLowerCase()] ?? 'text';
 }
 
+/** A finding's lines for people to read: "4", or "4-9" for a range. */
+export function lineRange(c) {
+  return c.endLine ? `${c.line}-${c.endLine}` : String(c.line);
+}
+
 /** One finding as it appears in the JSON document. endLine and suggestion only when there is one. */
 function jsonFinding(c) {
   return {

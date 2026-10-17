@@ -70,6 +70,8 @@ test('parseConfig rejects a wrong type for each key, naming the key and the file
     [{ minSeverity: 'high' }, /"minSeverity" in \.reviewbuddy\.json must be one of: security, bug, performance, suggestion\./],
     [{ failOn: 'security' }, /"failOn" in \.reviewbuddy\.json must be an array of severities/],
     [{ failOn: ['security', 'critical'] }, /"failOn" in \.reviewbuddy\.json must be an array of severities/],
+    [{ requestChangesOn: 'bug' }, /"requestChangesOn" in \.reviewbuddy\.json must be an array of severities/],
+    [{ requestChangesOn: ['blocker'] }, /"requestChangesOn" in \.reviewbuddy\.json must be an array of severities/],
     [{ timeout: '60' }, /"timeout" in \.reviewbuddy\.json must be a number of seconds/],
     [{ timeout: -1 }, /"timeout" in \.reviewbuddy\.json must be a number of seconds/],
   ];
@@ -101,7 +103,7 @@ test('parseConfig refuses anything that looks like a secret, and says where secr
 
 test('parseConfig warns about unknown keys and still uses the rest', () => {
   assert.deepEqual(parseConfig('{"minSeverity": "bug", "severity": "bug"}'), { minSeverity: 'bug' });
-  assert.match(warned(), /Warning: unknown key "severity" in \.reviewbuddy\.json, ignoring it\. Known keys: provider, model, ignore, defaultIgnore, minSeverity, failOn, timeout, concurrency, maxFiles, maxChunksPerFile, format, output\./);
+  assert.match(warned(), /Warning: unknown key "severity" in \.reviewbuddy\.json, ignoring it\. Known keys: provider, model, ignore, defaultIgnore, minSeverity, failOn, requestChangesOn, timeout, concurrency, maxFiles, maxChunksPerFile, format, output\./);
 });
 
 test('parseConfig reads "format" in any case and rejects unknown ones', () => {
@@ -154,6 +156,7 @@ test('resolveSettings uses the built-in defaults when nothing is set', () => {
     providerSource: 'default',
     model: undefined,
     failOn: [],
+    requestChangesOn: [],
     minSeverity: undefined,
     timeoutMs: undefined,
     format: undefined,
@@ -174,6 +177,20 @@ test('resolveSettings takes the format from a flag, then a variable, then the fi
   assert.equal(resolveSettings({ env: { REVIEWBUDDY_FORMAT: '' }, file: fromFile }).format, 'json');
   assert.throws(() => resolveSettings({ env: { REVIEWBUDDY_FORMAT: 'xml' } }), /Unknown format "xml" in REVIEWBUDDY_FORMAT\. Use one of: text, json, sarif\./);
   assert.throws(() => resolveSettings({ flags: { format: 'md' } }), /Unknown format "md" in --format\./);
+});
+
+test('resolveSettings takes requestChangesOn from a flag, then a variable, then the file, and defaults to none', () => {
+  const fromFile = parseConfig('{"requestChangesOn": ["Security", "bug", "security"]}');
+  assert.deepEqual(fromFile, { requestChangesOn: ['security', 'bug'] });
+  assert.deepEqual(resolveSettings({}).requestChangesOn, []);
+  assert.deepEqual(resolveSettings({ file: fromFile }).requestChangesOn, ['security', 'bug']);
+  assert.deepEqual(resolveSettings({ env: { REVIEWBUDDY_REQUEST_CHANGES_ON: 'Security' }, file: fromFile }).requestChangesOn, ['security']);
+  assert.deepEqual(resolveSettings({
+    flags: { 'request-changes-on': 'performance' }, env: { REVIEWBUDDY_REQUEST_CHANGES_ON: 'bug' }, file: fromFile,
+  }).requestChangesOn, ['performance']);
+  assert.deepEqual(resolveSettings({ env: { REVIEWBUDDY_REQUEST_CHANGES_ON: '' }, file: fromFile }).requestChangesOn, ['security', 'bug']);
+  assert.throws(() => resolveSettings({ flags: { 'request-changes-on': 'security,blocker' } }), /Unknown severity "blocker" in --request-changes-on\./);
+  assert.throws(() => resolveSettings({ env: { REVIEWBUDDY_REQUEST_CHANGES_ON: 'nope' } }), /Unknown severity "nope" in REVIEWBUDDY_REQUEST_CHANGES_ON\./);
 });
 
 test('resolveSettings takes the output from a flag, then a variable, then the file', () => {

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import {
-  formatJson, formatSarif, outputFormat, parseFormat, sarifUri, SARIF_LEVEL,
+  formatJson, formatSarif, lineRange, outputFormat, parseFormat, sarifUri, SARIF_LEVEL,
 } from '../src/output.js';
 
 const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
@@ -166,4 +166,9 @@ test('formatSarif with no findings is a valid log with an empty results array', 
   const log = formatSarif([], { provider: 'ollama', model: 'm' });
   assertValidSarif(log);
   assert.deepEqual(log.runs[0].results, []);
+});
+
+test('lineRange shows a line or a range', () => {
+  assert.equal(lineRange({ line: 4 }), '4');
+  assert.equal(lineRange({ line: 4, endLine: 9 }), '4-9');
 });

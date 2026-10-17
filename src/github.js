@@ -104,26 +104,46 @@ export function listReviewComments(pr, token) {
   return listAll(pr, token, `pulls/${pr.number}/comments`);
 }
 
+// reviewbuddy never approves: a review is a comment, or a change request when --request-changes-on asks for one.
+export const REVIEW_EVENTS = ['COMMENT', 'REQUEST_CHANGES'];
+
 /**
- * Post a review with inline comments. It is always a plain comment review:
- * reviewbuddy never approves or requests changes.
- * comments: [{ path, line, body }], where line is a line number in the new file.
+ * Post a review with inline comments. event is one of REVIEW_EVENTS (default COMMENT); anything else throws.
+ * comments: [{ path, line, start_line?, body }], line numbers in the new file. A range comment has
+ * start_line (its first line) and line (its last), both on the new side.
  */
-export async function postReview(pr, token, { commitId, body, comments }) {
+export async function postReview(pr, token, {
+  commitId, body, comments, event = 'COMMENT',
+}) {
+  if (!REVIEW_EVENTS.includes(event)) throw new Error(`reviewbuddy never posts a review with event ${event}.`);
   const response = await request(pr, token, `pulls/${pr.number}/reviews`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       commit_id: commitId,
-      event: 'COMMENT',
+      event,
       body,
-      comments: comments.map((c) => ({ ...c, side: 'RIGHT' })),
+      comments: comments.map((c) => ({ ...c, ...(c.start_line && { start_side: 'RIGHT' }), side: 'RIGHT' })),
     }),
   }, {
     // A dropped connection or a 5xx may come after GitHub created the review,
     // and retrying would post it twice. A 429 means it was never processed.
     retryNetworkErrors: false,
     retryStatuses: [429],
+  });
+  return response.json();
+}
+
+/**
+ * Dismiss a review (reviewbuddy's own change request) with a short message, so it stops blocking the merge.
+ * Needs "Pull requests: Read and write"; on a protected branch that restricts who can dismiss reviews,
+ * the token's user or app must be on that list.
+ */
+export async function dismissReview(pr, token, id, message) {
+  const response = await request(pr, token, `pulls/${pr.number}/reviews/${id}/dismissals`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message, event: 'DISMISS' }),
   });
   return response.json();
 }

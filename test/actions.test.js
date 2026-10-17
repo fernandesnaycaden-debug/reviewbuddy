@@ -94,3 +94,8 @@ test('isForkPullRequest is false without a readable event', async () => {
   process.env.GITHUB_EVENT_PATH = join(dir, 'missing.json');
   assert.equal(await isForkPullRequest(), false);
 });
+
+test('annotationsFor gives a range finding an endLine', () => {
+  const [line] = annotationsFor([{ filename: 'a.js', comments: [{ line: 4, endLine: 9, severity: 'bug', message: 'Loop' }] }]);
+  assert.equal(line, '::error file=a.js,line=4,endLine=9,title=reviewbuddy%3A BUG::Loop');
+});

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import {
-  addedLines, chunkDiff, commentableLines, decodeDiff, filesFromApi, numberDiffLines, patchToFile, splitDiff,
+  addedLines, chunkDiff, commentableLines, decodeDiff, filesFromApi, hunkIndex, numberDiffLines, patchToFile, splitDiff,
 } from '../src/diff.js';
 
 const gitDiff = [
@@ -159,4 +159,13 @@ test('filesFromApi lists files GitHub sent no patch for as too large, but not bi
   ]);
   assert.deepEqual(files.map((f) => f.filename), ['a.js']);
   assert.deepEqual(tooLarge, ['huge.js']);
+});
+
+test('hunkIndex numbers the hunk of every added and context line', () => {
+  const diff = [
+    '--- a/a.js', '+++ b/a.js',
+    '@@ -1,2 +1,3 @@', ' a', '+b', ' c',
+    '@@ -10,1 +11,2 @@', '-old', '+d', ' e', '',
+  ].join('\n');
+  assert.deepEqual([...hunkIndex(diff)], [[1, 0], [2, 0], [3, 0], [11, 1], [12, 1]]);
 });

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, mock, test } from 'node:test';
 import {
-  getCompareDiff, getCompareFiles, getFileContent, getPullRequest, getPullRequestDiff, listPullRequestFiles,
+  dismissReview, getCompareDiff, getCompareFiles, getFileContent, getPullRequest, getPullRequestDiff, listPullRequestFiles,
   listReviewComments, listReviews, MAX_PR_FILES, postReview,
 } from '../src/github.js';
 import { resetPauses } from '../src/http.js';
@@ -119,6 +119,43 @@ test('postReview posts a comment review on the right side of the diff', async ()
     body: 'Summary',
     comments: [{ path: 'a.js', line: 3, body: 'Bug', side: 'RIGHT' }],
   });
+});
+
+test('postReview posts a range as start_line and line, both on the right side', async () => {
+  const fetch = mockFetch(json({ html_url: 'u' }));
+  await postReview(pr, 'tok', {
+    commitId: 'abc', body: 'Summary', comments: [{ path: 'a.js', start_line: 4, line: 9, body: 'Loop' }],
+  });
+  assert.deepEqual(JSON.parse(fetch.mock.calls[0].arguments[1].body).comments, [{
+    path: 'a.js', start_line: 4, line: 9, body: 'Loop', start_side: 'RIGHT', side: 'RIGHT',
+  }]);
+});
+
+test('postReview requests changes when asked, and never approves', async () => {
+  const fetch = mockFetch(json({ html_url: 'u' }));
+  await postReview(pr, 'tok', {
+    commitId: 'abc', body: 'Summary', comments: [], event: 'REQUEST_CHANGES',
+  });
+  assert.equal(JSON.parse(fetch.mock.calls[0].arguments[1].body).event, 'REQUEST_CHANGES');
+
+  for (const event of ['APPROVE', 'approve', 'PENDING', '']) {
+    await assert.rejects(
+      postReview(pr, 'tok', {
+        commitId: 'abc', body: '', comments: [], event,
+      }),
+      /reviewbuddy never posts a review with event/,
+    );
+  }
+  assert.equal(fetch.mock.callCount(), 1);
+});
+
+test('dismissReview dismisses a review with a message', async () => {
+  const fetch = mockFetch(json({ id: 7, state: 'DISMISSED' }));
+  await dismissReview(pr, 'tok', 7, 'Fixed.');
+  const [url, init] = fetch.mock.calls[0].arguments;
+  assert.equal(url, 'https://api.github.com/repos/o/r/pulls/12/reviews/7/dismissals');
+  assert.equal(init.method, 'PUT');
+  assert.deepEqual(JSON.parse(init.body), { message: 'Fixed.', event: 'DISMISS' });
 });
 
 test('errors explain common HTTP statuses', async () => {
