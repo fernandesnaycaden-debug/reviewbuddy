@@ -1,4 +1,4 @@
-name: reviewbuddy
+name: ReviewBuddy AI Code Review
 description: AI code review on every pull request, posted as inline comments. Can fail the check or request changes on chosen severities.
 # Settings also come from the reviewed repo's .reviewbuddy.json and .reviewbuddy.md, read from the PR's base branch.
 # A non-empty input below overrides the same setting in .reviewbuddy.json.

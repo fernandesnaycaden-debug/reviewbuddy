@@ -147,3 +147,9 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# reviewbuddy output (npm run review writes review.md; -o writes wherever you point it)
+review.md
+review-report.md
+*.sarif
+reviewbuddy-report.*

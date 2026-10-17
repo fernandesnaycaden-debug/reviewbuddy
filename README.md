@@ -133,7 +133,7 @@ Or pipe a diff in, and pass `-` as the target:
 git diff main...HEAD -- src/ | npx reviewbuddy -
 ```
 
-Diff files and stdin can be UTF-8 (with or without a byte order mark) or UTF-16 with a byte order mark. So `git diff > changes.diff` in Windows PowerShell 5.1, which writes UTF-16, works now. **One catch in PowerShell 5.1:** piping (`git diff | npx reviewbuddy -`) re-encodes the text using `$OutputEncoding`, which is ASCII by default, so non-ASCII characters (accents, emoji, CJK) reach reviewbuddy as `?`. In PowerShell, use the git flags above or a diff file instead. PowerShell 7 and bash pipe UTF-8 unchanged.
+Diff files and stdin can be UTF-8 (with or without a byte order mark) or UTF-16 with a byte order mark. So `git diff > changes.diff` in Windows PowerShell 5.1, which writes UTF-16, works. **One catch in PowerShell 5.1:** piping (`git diff | npx reviewbuddy -`) re-encodes the text using `$OutputEncoding`, which is ASCII by default, so non-ASCII characters (accents, emoji, CJK) reach reviewbuddy as `?`. In PowerShell, use the git flags above or a diff file instead. PowerShell 7 and bash pipe UTF-8 unchanged.
 
 Files with no added lines (deleted files, pure renames, binary files) are skipped. So are files that aren't worth a model's time: lockfiles (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`), `*.min.*`, `*.map`, `*.snap`, `*.svg`, and anything under `dist/`, `build/`, `vendor/` or `node_modules/`.
 
@@ -160,7 +160,7 @@ A diff alone hides a lot: a value that looks unchecked may be validated a few li
 
   If the file isn't there, or its content doesn't match the diff (say, a different branch is checked out), that file is reviewed from the diff alone. Paths in the diff that lead outside the directory (`../`) are never read.
 
-The context has to fit in a per-provider budget for the whole prompt, so the model's context window and free-tier limits aren't exceeded. If the full file doesn't fit next to the diff, reviewbuddy sends only the 40 lines around each change. If even that doesn't fit, it sends the diff alone, as before.
+The context has to fit in a per-provider budget for the whole prompt, so the model's context window and free-tier limits aren't exceeded. If the full file doesn't fit next to the diff, reviewbuddy sends only the 40 lines around each change. If even that doesn't fit, it sends the diff alone.
 
 | Provider | Prompt budget (characters, about 3 per token) |
 |----------|----------------------------------|
@@ -452,20 +452,22 @@ No checkout step is needed: the action downloads the PR's diff and the changed f
 | Input | Default | Meaning |
 |-------|---------|---------|
 | `provider` | none (required) | `groq`, `openrouter`, `gemini` or `anthropic`. `ollama` works only with `OLLAMA_URL` set to a server the runner can reach |
-| `api-key` | none | API key for that provider; pass it from a secret |
-| `model` | the provider's default | Model to use, like that provider's `*_MODEL` variable |
-| `fail-on` | none | Comma-separated severities that fail the check, like `--fail-on` |
-| `request-changes-on` | none (comment only) | Comma-separated severities that make the review request changes, like `--request-changes-on`. It never approves |
-| `min-severity` | none (report everything) | Least serious severity to report: `security`, `bug`, `performance` or `suggestion`, like `--min-severity` |
-| `ignore` | none | Extra comma-separated file patterns to skip, like `--ignore` |
+| `api-key` | empty | API key for that provider; pass it from a secret |
+| `model` | empty: the file's `model` if it names the same provider, else the provider's default | Model to use, like that provider's `*_MODEL` variable |
+| `fail-on` | empty: the file's `failOn`, else never fails | Comma-separated severities that fail the check, like `--fail-on` |
+| `request-changes-on` | empty: the file's `requestChangesOn`, else comment only | Comma-separated severities that make the review request changes, like `--request-changes-on`. It never approves |
+| `min-severity` | empty: the file's `minSeverity`, else report everything | Least serious severity to report: `security`, `bug`, `performance` or `suggestion`, like `--min-severity` |
+| `ignore` | empty | Extra comma-separated file patterns to skip, like `--ignore`. Added to the defaults and the file's `ignore` |
 | `full` | `false` | `true` reviews the whole PR every time, like `--full` |
-| `timeout` | the provider's default | Seconds a single model request may take, like `--timeout` |
-| `concurrency` | the provider's default (2 for `groq` and `openrouter`, 4 for `gemini` and `anthropic`) | Files to review at once, 1 to 16, like `--concurrency`; see [Large pull requests](#large-pull-requests) |
-| `max-files` | none (no limit) | Review at most this many files, like `--max-files` |
-| `max-chunks-per-file` | `10` | Review at most this many pieces of one file (`0` = no limit), like `--max-chunks-per-file` |
+| `timeout` | empty: the file's `timeout`, else the provider's default | Seconds a single model request may take (`0` = no limit), like `--timeout` |
+| `concurrency` | empty: the file's `concurrency`, else the provider's default (2 for `groq` and `openrouter`, 4 for `gemini` and `anthropic`) | Files to review at once, 1 to 16, like `--concurrency`; see [Large pull requests](#large-pull-requests) |
+| `max-files` | empty: the file's `maxFiles`, else no limit | Review at most this many files, like `--max-files` |
+| `max-chunks-per-file` | empty: the file's `maxChunksPerFile`, else `10` | Review at most this many pieces of one file (`0` = no limit), like `--max-chunks-per-file` |
 | `config` | `true` | `false` ignores the repo's `.reviewbuddy.json` and `.reviewbuddy.md`, like `--no-config` |
-| `sarif-file` | none | Also write the findings as SARIF to this path, for [Code Scanning](#upload-findings-to-code-scanning). Implies `full` |
+| `sarif-file` | empty (no file) | Also write the findings as SARIF to this path, for [Code Scanning](#upload-findings-to-code-scanning). Implies `full` |
 | `github-token` | `${{ github.token }}` | Token used to read the PR, post the review and dismiss reviewbuddy's own outdated change requests. Needs `pull-requests: write` |
+
+"The file" is the reviewed repo's `.reviewbuddy.json`.
 
 The action has one output, `sarif-file`: the SARIF file's path when `sarif-file` was set and the file was written, empty otherwise.
 
@@ -535,6 +537,18 @@ jobs:
 - On a fork PR without an API key the review is skipped, no file is written, the output stays empty, and the upload step is skipped too.
 
 The CLI writes the same file locally with `--format sarif` or `-o results.sarif`, for VS Code's SARIF Viewer or any other SARIF tool.
+
+## Versions
+
+Pick how closely your workflow follows new releases:
+
+| `uses:` | What you get |
+|---------|--------------|
+| `fernandesnaycaden-debug/reviewbuddy@v1` | The latest 1.x release. The `v1` tag moves with each release, so you get fixes and new features without breaking changes |
+| `fernandesnaycaden-debug/reviewbuddy@v1.0.0` | Exactly that release, until you change it |
+| `fernandesnaycaden-debug/reviewbuddy@<full commit SHA>` | The most secure option: a commit SHA can't be moved to other code, while a tag can. Add the version as a comment (`# v1.0.0`), and Dependabot can keep it up to date |
+
+What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Blocking merges
 
@@ -640,7 +654,7 @@ Write rules the way you'd brief a new reviewer: what your project does different
 - Money is stored and computed as integer cents (`amountCents`). Floating-point arithmetic on money is a `bug`.
 ```
 
-The rules go into every request, after the built-in instructions, in a section titled "Project rules from the repository". The built-in instructions still win: the model replies in the same JSON, comments only on added lines, and is told to ignore anything in the rules that asks it to change the output format or report nothing. Without a `.reviewbuddy.md`, the prompt is exactly what it was before this feature.
+The rules go into every request, after the built-in instructions, in a section titled "Project rules from the repository". The built-in instructions still win: the model replies in the same JSON, comments only on added lines, and is told to ignore anything in the rules that asks it to change the output format or report nothing. Without a `.reviewbuddy.md`, the prompt holds only the built-in instructions.
 
 The rules are capped at **4,000 characters** (about 1,300 tokens). A longer file is cut at the last line break before the cap, with a warning. The rules count against the provider's [prompt budget](#full-file-context): with long rules, the full-file context shrinks to the code around each change, or to the diff alone, rather than overflowing the model's context.
 
@@ -692,7 +706,7 @@ These variables override the reviewed repo's [`.reviewbuddy.json`](#configure-pe
 | `REVIEWBUDDY_MIN_SEVERITY` | none (report everything) | Least serious severity to report (`security` > `bug` > `performance` > `suggestion`), like `--min-severity` |
 | `REVIEWBUDDY_TIMEOUT` | `600` (Ollama), `300` (cloud) | Seconds a single model request may take, like `--timeout`. `0` means no limit |
 | `REVIEWBUDDY_FORMAT` | `text` (or from `--output`'s extension) | `text`, `json` or `sarif`, like `--format` |
-| `REVIEWBUDDY_OUTPUT` | none (or `review-report.md` via `npm run review`) | Write results to a file, like `--output` |
+| `REVIEWBUDDY_OUTPUT` | none (or `review.md` via `npm run review`) | Write results to a file, like `--output` |
 | `REVIEWBUDDY_CONCURRENCY` | `1` (Ollama), `2` (Groq, OpenRouter), `4` (Gemini, Anthropic) | Files to review at once, 1 to 16, like `--concurrency` |
 | `REVIEWBUDDY_MAX_FILES` | none (no limit) | Review at most this many files, like `--max-files` |
 | `REVIEWBUDDY_MAX_CHUNKS_PER_FILE` | `10` | Review at most this many pieces of one file, like `--max-chunks-per-file`. `0` means no limit |
