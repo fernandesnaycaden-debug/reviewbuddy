@@ -160,6 +160,7 @@ function withEnv(vars, fn) {
     REVIEWBUDDY_REQUEST_CHANGES_ON: '',
     REVIEWBUDDY_MIN_SEVERITY: '',
     REVIEWBUDDY_IGNORE: '',
+    REVIEWBUDDY_REVIEWER: '',
     REVIEWBUDDY_TIMEOUT: '',
     REVIEWBUDDY_FORMAT: '',
     REVIEWBUDDY_CONCURRENCY: '',
@@ -218,19 +219,26 @@ const SOURCE = "const a = 1;\nconst key = 'secret';\nexport { a };\n";
  * with an error status instead; delay(filename) holds its reply back that many ms.
  * rejectRequestChanges answers a change request with GitHub's 422 for the author's own PR. dismissStatus answers
  * dismissals with that error status.
+ * A review without a user was posted by the Actions bot. viewer: the token's user (GET /user), or null to answer 403.
  * Returns the posted review bodies, every attempted review's event, the dismissals ({ url, body }), the requested URLs,
  * and the user and system prompts sent to the model.
  */
 function fakeGitHub({
   reviews = [], comments = [], compare = compareDiff, findings = [hardcodedKey], postStatus, source = SOURCE,
   config = {}, headConfig = {}, diffStatus, prFiles = [], changedFiles, compareStatus, compareFiles = [],
-  ollamaStatus = () => undefined, delay = () => 0, rejectRequestChanges = false, dismissStatus,
+  ollamaStatus = () => undefined, delay = () => 0, rejectRequestChanges = false, dismissStatus, viewer = 'maintainer',
 } = {}) {
   const calls = {
     posted: [], events: [], dismissed: [], urls: [], reviewed: [], systems: [],
   };
+  reviews = reviews.map((r) => ({ user: { login: 'github-actions[bot]' }, ...r }));
   mock.method(globalThis, 'fetch', async (url, init) => {
     calls.urls.push(url);
+    if (url === 'https://api.github.com/user') {
+      return viewer === null
+        ? Response.json({ message: 'Resource not accessible by integration' }, { status: 403 })
+        : Response.json({ login: viewer });
+    }
     if (url === 'http://ollama.test/api/chat') {
       const { messages } = JSON.parse(init.body);
       const filename = messages.at(-1).content.match(/^File: (.+)$/m)[1];
@@ -323,6 +331,46 @@ test('main stops when the head commit was already reviewed', () => github(async 
   // The PR, the two config files, its reviews.
   assert.equal(calls.urls.length, 4);
   assert.match(logged(), /Already reviewed abc1234, nothing new/);
+}));
+
+test("main ignores a marker posted by another account, so a forged one can't skip the review", () => github(async () => {
+  const calls = fakeGitHub({ reviews: [{ id: 1, body: markerFor(HEAD), user: { login: 'mallory' } }] });
+
+  await main([PR_URL]);
+
+  assert.equal(calls.posted.length, 1);
+  assert.doesNotMatch(logged(), /Already reviewed/);
+  assert.ok(calls.urls.includes('https://api.github.com/user'));
+  assert.match(warned(), /Ignoring 1 review with reviewbuddy's marker by mallory: only reviewbuddy's own reviews \(by github-actions\[bot\], maintainer\)/);
+}));
+
+test("main ignores another account's marker when the token has no user, as in Actions", () => github(async () => {
+  const calls = fakeGitHub({ reviews: [{ id: 1, body: markerFor(HEAD), user: { login: 'mallory' } }], viewer: null });
+
+  await main([PR_URL]);
+
+  assert.equal(calls.posted.length, 1);
+  assert.match(warned(), /by mallory: only reviewbuddy's own reviews \(by github-actions\[bot\]\)/);
+}));
+
+test("main trusts a marker posted by the token's own user", () => github(async () => {
+  const calls = fakeGitHub({ reviews: [{ id: 1, body: markerFor(HEAD), user: { login: 'maintainer' } }] });
+
+  await main([PR_URL]);
+
+  assert.equal(calls.posted.length, 0);
+  assert.match(logged(), /Already reviewed abc1234, nothing new/);
+}));
+
+test("main trusts a marker posted by REVIEWBUDDY_REVIEWER without looking up the token's user", () => withEnv({
+  GITHUB_TOKEN: 'tok', OLLAMA_URL: 'http://ollama.test', REVIEWBUDDY_REVIEWER: 'my-app[bot]',
+}, async () => {
+  const calls = fakeGitHub({ reviews: [{ id: 1, body: markerFor(HEAD), user: { login: 'my-app[bot]' } }], viewer: null });
+
+  await main([PR_URL]);
+
+  assert.equal(calls.posted.length, 0);
+  assert.ok(!calls.urls.includes('https://api.github.com/user'));
 }));
 
 test('main finds the latest marked review on a later page', () => github(async () => {

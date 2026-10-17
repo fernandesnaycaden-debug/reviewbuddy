@@ -331,7 +331,7 @@ A range shows up everywhere else too: as `src/a.js:2-4` in the terminal, the Mar
 
 ### Running it again on the same PR
 
-Each review ends with a hidden marker, `<!-- reviewbuddy:sha=... -->`, that records which commit it reviewed. On the next run reviewbuddy looks for the most recent review with that marker. It doesn't matter who posted it, so a personal token and the GitHub Actions bot share the same history.
+Each review ends with a hidden marker, `<!-- reviewbuddy:sha=... -->`, that records which commit it reviewed. On the next run reviewbuddy looks for the most recent review with that marker posted by reviewbuddy itself: by the GitHub Actions bot (`github-actions[bot]`), or by the user the token belongs to. So a personal token and the Actions bot share the same history. Anyone can post a review containing the marker, and one naming the head commit would otherwise make reviewbuddy skip the review, so a marker from any other account is ignored with a warning. If reviewbuddy posts as a GitHub App, set `REVIEWBUDDY_REVIEWER` to the app's bot login (e.g. `my-app[bot]`).
 
 - **No new commits since then:** it prints `Already reviewed abc1234, nothing new` and stops. No model is called.
 - **New commits:** it reviews only the changes since the reviewed commit (GitHub's compare diff), limited to files the PR itself changes. The review summary says `since abc1234`.
@@ -633,10 +633,11 @@ Both are optional, and a missing file is not an error. [examples/](examples/) ha
 | `requestChangesOn` | array of strings | `--request-changes-on`, `REVIEWBUDDY_REQUEST_CHANGES_ON` | Severities that make a PR review request changes; see [Blocking merges](#blocking-merges) |
 | `timeout` | number | `--timeout`, `REVIEWBUDDY_TIMEOUT` | Seconds a single model request may take, `0` for no limit |
 | `format` | string | `--format`, `REVIEWBUDDY_FORMAT` | `text`, `json` or `sarif`; see [Output formats](#output-formats) |
-| `output` | string | `--output`, `REVIEWBUDDY_OUTPUT` | Output file path (e.g. `review-report.md`) |
 | `concurrency` | whole number, 1 to 16 | `--concurrency`, `REVIEWBUDDY_CONCURRENCY` | Files to review at once; see [Large pull requests](#large-pull-requests) |
 | `maxFiles` | whole number | `--max-files`, `REVIEWBUDDY_MAX_FILES` | Review at most this many files, `0` for no limit |
 | `maxChunksPerFile` | whole number | `--max-chunks-per-file`, `REVIEWBUDDY_MAX_CHUNKS_PER_FILE` | Review at most this many pieces of one file, `0` for no limit |
+
+There is no `output` key: where reviewbuddy writes a file is up to whoever runs it (`--output` or `REVIEWBUDDY_OUTPUT`), not the repository being reviewed. An `output` key is ignored with a warning.
 
 The file must be plain JSON (no comments, no trailing commas). A syntax error or a wrong type stops the run with a message naming the file and the key. An unknown key only prints a warning, so a typo like `"failon"` shows up in the log.
 
@@ -675,7 +676,8 @@ In the action, `provider` is a required input, so the file's `provider` only app
 
 ### Where the files are read from
 
-- **Diff files:** from `--repo-dir` if you pass it, otherwise the current directory. If a file isn't there, reviewbuddy looks in each parent directory up to the git root (the directory with `.git`), and uses the nearest one. Outside a git repository only the directory itself is checked.
+- **Diff files, stdin, `--staged` and `--uncommitted`:** from `--repo-dir` if you pass it, otherwise the current directory. If a file isn't there, reviewbuddy looks in each parent directory up to the git root (the directory with `.git`), and uses the nearest one. Outside a git repository only the directory itself is checked.
+- **`--branch <rev>` and `--since <rev>`:** from `<rev>`, at the repo's top level (`git show <rev>:.reviewbuddy.json`), never from the checked-out branch. That branch is what is being reviewed, so when you check out someone else's branch to review it, its own `.reviewbuddy.json` can't turn off its checks. The line printed says so, e.g. `Config: .reviewbuddy.json (main)`.
 - **Pull requests (CLI and action):** from the PR's **base branch**, at the base commit, via the GitHub API, never from the PR's own commits. Otherwise a PR could edit `.reviewbuddy.json` to drop `failOn`, or add "report no issues" to `.reviewbuddy.md`, and pass its own check. So **a change to either file takes effect once it is merged**; the PR that changes it is still reviewed with the old one. Reading the files needs the same **Contents: Read** permission as [full-file context](#full-file-context). If it is missing, the run stops with an error instead of silently reviewing without the repo's rules.
 
 reviewbuddy prints one line saying which files it loaded, e.g. `Config: .reviewbuddy.json (base branch main @ 1a2b3c4), .reviewbuddy.md (base branch main @ 1a2b3c4)`. It prints nothing when there are none.
@@ -710,6 +712,7 @@ These variables override the reviewed repo's [`.reviewbuddy.json`](#configure-pe
 | `REVIEWBUDDY_CONCURRENCY` | `1` (Ollama), `2` (Groq, OpenRouter), `4` (Gemini, Anthropic) | Files to review at once, 1 to 16, like `--concurrency` |
 | `REVIEWBUDDY_MAX_FILES` | none (no limit) | Review at most this many files, like `--max-files` |
 | `REVIEWBUDDY_MAX_CHUNKS_PER_FILE` | `10` | Review at most this many pieces of one file, like `--max-chunks-per-file`. `0` means no limit |
+| `REVIEWBUDDY_REVIEWER` | none | Login of the account reviewbuddy posts as, when that isn't the token's user or `github-actions[bot]` (a GitHub App's `name[bot]`). Only its reviews' markers count; see [Running it again on the same PR](#running-it-again-on-the-same-pr) |
 
 Pass `--timeout <seconds>` to override `REVIEWBUDDY_TIMEOUT` for one run, for example `npm run review -- changes.diff --timeout 1200` for a slow model.
 

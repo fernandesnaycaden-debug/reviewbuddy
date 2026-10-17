@@ -4,6 +4,14 @@ All notable changes to reviewbuddy are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The GitHub Action's `@v1` tag always points at the latest 1.x release.
 
+## [Unreleased]
+
+### Security
+
+- **A forged review marker can no longer skip the review.** Only reviews posted by `github-actions[bot]`, the token's own user or `REVIEWBUDDY_REVIEWER` count as earlier reviewbuddy reviews. Before, anyone could post a review with `<!-- reviewbuddy:sha=<head> -->` and the next run printed "Already reviewed" and passed `--fail-on`.
+- **A repository can no longer choose where reviewbuddy writes files.** The `output` key in `.reviewbuddy.json` is ignored with a warning; use `--output` or `REVIEWBUDDY_OUTPUT`.
+- **`--branch` and `--since` read `.reviewbuddy.json` and `.reviewbuddy.md` from the revision given**, not from the checked-out branch being reviewed, as pull requests already read them from the base branch.
+
 ## [1.0.0] - 2026-10-17
 
 The first release. Use the action as `fernandesnaycaden-debug/reviewbuddy@v1`, or run the CLI with `npx github:fernandesnaycaden-debug/reviewbuddy`.

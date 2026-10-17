@@ -6,8 +6,8 @@ import {
   annotationsFor, appendStepSummary, inActions, isForkPullRequest, warning,
 } from './actions.js';
 import {
-  blockingReviews, dismissible, dropPosted, findingKey, latestMarkedReview, markerFor, openFindings, parseMarker,
-  postedKeys,
+  ACTIONS_BOT, blockingReviews, dismissible, dropPosted, findingKey, latestMarkedReview, markerFor, openFindings,
+  parseMarker, postedKeys, trustedReviews,
 } from './dedupe.js';
 import {
   decodeDiff, filesFromApi, hunkIndex, splitDiff,
@@ -16,11 +16,11 @@ import {
   checkRev, GIT_MODES, gitDiff, gitShow,
 } from './git.js';
 import {
-  dismissReview, getCompareDiff, getCompareFiles, getFileContent, getPullRequest, getPullRequestDiff,
+  dismissReview, getCompareDiff, getCompareFiles, getFileContent, getPullRequest, getPullRequestDiff, getViewerLogin,
   listPullRequestFiles, listReviewComments, listReviews, MAX_COMPARE_FILES, MAX_PR_FILES, parsePrUrl, postReview,
 } from './github.js';
 import {
-  findLocalConfig, loadConfig, loadRemoteConfig, resolveSettings,
+  findLocalConfig, findRevConfig, loadConfig, loadRemoteConfig, resolveSettings,
 } from './config.js';
 import { isIgnored } from './ignore.js';
 import { capInlineComments, MAX_INLINE_COMMENTS, selectFiles } from './limits.js';
@@ -98,7 +98,7 @@ async function run(argv) {
     }
     details = await getPullRequest(pr, token);
   }
-  const config = await repoConfig(flags['no-config'], pr, token, details, repoDir);
+  const config = await repoConfig(flags['no-config'], input, token, details, repoDir);
   const settings = resolveSettings({ flags, env: process.env, file: config.file });
   // The repo's config can set the format too.
   routeLogs(settings.format, settings.output);
@@ -196,12 +196,16 @@ async function selectProvider(name, model) {
 
 /**
  * The reviewed repo's .reviewbuddy.json and .reviewbuddy.md, parsed (see loadConfig).
- * For a PR they come from its base commit, not its head (see loadRemoteConfig for why);
- * for a diff file from repoDir or the current directory, or a parent up to the git root.
+ * For a PR they come from its base commit, not its head (see loadRemoteConfig for why); for --branch and
+ * --since from the revision given, not the checked-out branch (see findRevConfig); for anything else
+ * (input: see selectInput) from repoDir or the current directory, or a parent up to the git root.
  */
-async function repoConfig(skip, pr, token, details, repoDir) {
+async function repoConfig(skip, input, token, details, repoDir) {
   if (skip) return { file: {}, rules: undefined, summary: null };
-  const found = pr ? await loadRemoteConfig(pr, token, details.base) : await findLocalConfig(repoDir ?? '.');
+  let found;
+  if (input.pr) found = await loadRemoteConfig(input.pr, token, details.base);
+  else if (input.kind === 'git' && input.rev) found = await findRevConfig(input.rev, repoDir ?? '.');
+  else found = await findLocalConfig(repoDir ?? '.');
   return loadConfig(found);
 }
 
@@ -344,7 +348,7 @@ function remoteSource(pr, token, sha) {
  */
 async function reviewPullRequest(pr, token, details, options) {
   const { head, base } = details;
-  const reviews = await listReviews(pr, token);
+  const reviews = await ownReviews(token, await listReviews(pr, token));
   const ourReviews = new Set(reviews.filter((r) => parseMarker(r.body)).map((r) => r.id));
   // Inline comments from our earlier reviews, fetched at most once and only when needed.
   let ourComments;
@@ -440,6 +444,25 @@ async function reviewPullRequest(pr, token, details, options) {
   info(`Posted review: ${posted.html_url}`);
   await clear();
   return done;
+}
+
+/**
+ * The PR's reviews, without marked ones that reviewbuddy didn't post (see trustedReviews). Ours are those by the
+ * Actions bot, by the token's own user, or by REVIEWBUDDY_REVIEWER (a GitHub App's bot, e.g. "my-app[bot]").
+ * The token's user is only looked up when another account posted a review with the marker.
+ */
+async function ownReviews(token, reviews) {
+  const logins = new Set([ACTIONS_BOT, process.env.REVIEWBUDDY_REVIEWER?.trim()].filter(Boolean));
+  if (trustedReviews(reviews, logins).length === reviews.length) return reviews;
+  const viewer = await getViewerLogin(token);
+  if (viewer) logins.add(viewer);
+  const trusted = trustedReviews(reviews, logins);
+  const ignored = reviews.filter((r) => !trusted.includes(r));
+  if (ignored.length > 0) {
+    const authors = [...new Set(ignored.map((r) => r.user?.login ?? 'an unknown account'))].join(', ');
+    warnUser(`Ignoring ${plural(ignored.length, 'review')} with reviewbuddy's marker by ${authors}: only reviewbuddy's own reviews (by ${[...logins].join(', ')}) decide what was already reviewed. If reviewbuddy posts as another account, set REVIEWBUDDY_REVIEWER to its login.`);
+  }
+  return trusted;
 }
 
 /**

@@ -12,9 +12,21 @@ export function parseMarker(body) {
   return body?.match(MARKER)?.[1] ?? null;
 }
 
+// The account that posts reviews with an Actions workflow's GITHUB_TOKEN. Only the repo's own workflows
+// can post as it: a fork PR's token is read-only.
+export const ACTIONS_BOT = 'github-actions[bot]';
+
+/**
+ * reviews without the marked ones posted by an account not in logins. Anyone who can comment on a PR can post
+ * a review with our marker, and one naming the head commit would make the next run skip the review.
+ */
+export function trustedReviews(reviews, logins) {
+  return reviews.filter((r) => !parseMarker(r.body) || logins.has(r.user?.login));
+}
+
 /**
  * The last review that carries our marker, as { id, sha }, or null.
- * GitHub lists reviews oldest first. The author isn't checked: the token may be a person's or the Actions bot.
+ * GitHub lists reviews oldest first. The author isn't checked here: pass reviews through trustedReviews first.
  */
 export function latestMarkedReview(reviews) {
   let latest = null;

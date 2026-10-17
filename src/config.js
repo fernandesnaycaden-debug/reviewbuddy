@@ -4,6 +4,7 @@
 
 import { readFile, stat } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
+import { gitShow, runGit } from './git.js';
 import { getFileContent } from './github.js';
 import { DEFAULT_IGNORE, parsePatterns } from './ignore.js';
 import { FORMATS, parseFormat } from './output.js';
@@ -78,11 +79,10 @@ const FIELDS = {
     }
     return { format: value.toLowerCase() };
   },
-  output(value, where) {
-    if (typeof value !== 'string' || !value.trim()) throw new Error(`${where} must be a file path.`);
-    return { output: value.trim() };
-  },
 };
+
+// Keys a repository may not set: where reviewbuddy writes a file is for whoever runs it to choose.
+const RUNNER_ONLY = { output: '--output or REVIEWBUDDY_OUTPUT' };
 
 /** A .reviewbuddy.json value that must be an array of severities, returned lower case without repeats. */
 function severityList(value, where) {
@@ -104,7 +104,7 @@ function countField(value, where, { min = 0, max = Infinity }) {
  * Parse and validate .reviewbuddy.json. label names the file in errors.
  * Returns { provider?, model?, ignore?, defaultIgnore?, minSeverity?, failOn?, requestChangesOn?, timeoutMs?, format?,
  * concurrency?, maxFiles?, maxChunksPerFile? }.
- * Unknown keys are warned about and skipped; anything that looks like a secret is an error.
+ * Unknown keys and "output" are warned about and skipped; anything that looks like a secret is an error.
  */
 export function parseConfig(text, label = CONFIG_FILE) {
   let raw;
@@ -123,6 +123,10 @@ export function parseConfig(text, label = CONFIG_FILE) {
 
   const settings = {};
   for (const [key, value] of Object.entries(raw)) {
+    if (Object.hasOwn(RUNNER_ONLY, key)) {
+      console.warn(`Warning: ignoring "${key}" in ${label}: a repository can't choose where reviewbuddy writes files. Use ${RUNNER_ONLY[key]}.`);
+      continue;
+    }
     if (!Object.hasOwn(FIELDS, key)) {
       console.warn(`Warning: unknown key "${key}" in ${label}, ignoring it. Known keys: ${Object.keys(FIELDS).join(', ')}.`);
       continue;
@@ -174,6 +178,21 @@ export async function findLocalConfig(dir = '.') {
         break;
       }
     }
+  }
+  return found;
+}
+
+/**
+ * Find .reviewbuddy.json and .reviewbuddy.md for --branch or --since: at the top of the repo holding dir, in
+ * revision rev, never in the working tree. The checked-out branch is what is being reviewed and, like a PR's
+ * head, could drop failOn, ignore its own files or tell the model to report no issues. Returns { [name]: { text, label } }.
+ */
+export async function findRevConfig(rev, dir = '.', { exec } = {}) {
+  const root = resolve((await runGit(['rev-parse', '--show-toplevel'], dir, { exec })).trim());
+  const found = {};
+  for (const name of [CONFIG_FILE, RULES_FILE]) {
+    const text = await gitShow(root, `${rev}:`, name, { exec });
+    if (text !== null) found[name] = { text, label: `${name} (${rev})` };
   }
   return found;
 }
@@ -278,7 +297,7 @@ export function resolveSettings({ flags = {}, env = {}, file = {} }) {
     timeoutMs: timeout ? parseTimeout(timeout.value, timeout.label) : file.timeoutMs,
     // undefined: --output's extension decides, else text.
     format: format ? parseFormat(format.value, format.label) : file.format,
-    output: output ? output.value : file.output,
+    output: output?.value,
     // undefined: the provider's default (see defaultConcurrency).
     concurrency: concurrency ? parseCount(concurrency.value, concurrency.label, { min: 1, max: MAX_CONCURRENCY }) : file.concurrency,
     // 0: no limit.

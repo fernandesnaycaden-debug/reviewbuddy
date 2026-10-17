@@ -103,7 +103,7 @@ test('parseConfig refuses anything that looks like a secret, and says where secr
 
 test('parseConfig warns about unknown keys and still uses the rest', () => {
   assert.deepEqual(parseConfig('{"minSeverity": "bug", "severity": "bug"}'), { minSeverity: 'bug' });
-  assert.match(warned(), /Warning: unknown key "severity" in \.reviewbuddy\.json, ignoring it\. Known keys: provider, model, ignore, defaultIgnore, minSeverity, failOn, requestChangesOn, timeout, concurrency, maxFiles, maxChunksPerFile, format, output\./);
+  assert.match(warned(), /Warning: unknown key "severity" in \.reviewbuddy\.json, ignoring it\. Known keys: provider, model, ignore, defaultIgnore, minSeverity, failOn, requestChangesOn, timeout, concurrency, maxFiles, maxChunksPerFile, format\./);
 });
 
 test('parseConfig reads "format" in any case and rejects unknown ones', () => {
@@ -112,10 +112,9 @@ test('parseConfig reads "format" in any case and rejects unknown ones', () => {
   assert.throws(() => parseConfig('{"format": 1}'), /"format" in \.reviewbuddy\.json must be one of/);
 });
 
-test('parseConfig reads "output" and rejects non-strings', () => {
-  assert.deepEqual(parseConfig('{"output": "report.md"}'), { output: 'report.md' });
-  assert.throws(() => parseConfig('{"output": ""}'), /"output" in \.reviewbuddy\.json must be a file path\./);
-  assert.throws(() => parseConfig('{"output": 123}'), /"output" in \.reviewbuddy\.json must be a file path\./);
+test('parseConfig ignores "output", with a warning: a repo must not choose where files are written', () => {
+  assert.deepEqual(parseConfig('{"output": "../../.ssh/authorized_keys", "minSeverity": "bug"}'), { minSeverity: 'bug' });
+  assert.match(warned(), /Warning: ignoring "output" in \.reviewbuddy\.json: a repository can't choose where reviewbuddy writes files\. Use --output or REVIEWBUDDY_OUTPUT\./);
 });
 
 // .reviewbuddy.md
@@ -193,12 +192,11 @@ test('resolveSettings takes requestChangesOn from a flag, then a variable, then 
   assert.throws(() => resolveSettings({ env: { REVIEWBUDDY_REQUEST_CHANGES_ON: 'nope' } }), /Unknown severity "nope" in REVIEWBUDDY_REQUEST_CHANGES_ON\./);
 });
 
-test('resolveSettings takes the output from a flag, then a variable, then the file', () => {
+test('resolveSettings takes the output from a flag, then a variable, never the file', () => {
   const fromFile = { output: 'file.md' };
-  assert.equal(resolveSettings({ file: fromFile }).output, 'file.md');
+  assert.equal(resolveSettings({ file: fromFile }).output, undefined);
   assert.equal(resolveSettings({ env: { REVIEWBUDDY_OUTPUT: 'env.md' }, file: fromFile }).output, 'env.md');
   assert.equal(resolveSettings({ flags: { output: 'flag.md' }, env: { REVIEWBUDDY_OUTPUT: 'env.md' }, file: fromFile }).output, 'flag.md');
-  assert.equal(resolveSettings({ env: { REVIEWBUDDY_OUTPUT: '' }, file: fromFile }).output, 'file.md');
 });
 
 test('resolveSettings takes each setting from the file over the defaults', () => {

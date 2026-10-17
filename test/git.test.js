@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import {
   mkdir, mkdtemp, rm, writeFile,
 } from 'node:fs/promises';
@@ -9,6 +10,7 @@ import { afterEach, beforeEach, mock, test } from 'node:test';
 import {
   checkRev, diffArgs, gitDiff, gitShow, runGit,
 } from '../src/git.js';
+import { findRevConfig } from '../src/config.js';
 import { main } from '../src/index.js';
 
 const hasGit = (() => {
@@ -191,7 +193,7 @@ function fakeOllama() {
 }
 
 /** Run main against a mocked Ollama with clean environment variables. */
-async function review(args) {
+async function review(args, { config = false } = {}) {
   const vars = {
     OLLAMA_URL: 'http://ollama.test', REVIEWBUDDY_PROVIDER: '', REVIEWBUDDY_FORMAT: '', REVIEWBUDDY_FAIL_ON: '', REVIEWBUDDY_MIN_SEVERITY: '', GITHUB_ACTIONS: '',
   };
@@ -199,7 +201,7 @@ async function review(args) {
   Object.assign(process.env, vars);
   try {
     const prompts = fakeOllama();
-    await main([...args, '--no-config']);
+    await main(config ? args : [...args, '--no-config']);
     return prompts;
   } finally {
     for (const [k, v] of Object.entries(saved)) {
@@ -255,6 +257,26 @@ test('--branch and --since review commits only, with HEAD as context', needsGit,
     assert.doesNotMatch(prompt, /dirty/, args.join(' '));
     assert.match(fullFile(prompt), /const f = 'feature';/, args.join(' '));
   }
+});
+
+test('--branch and --since read the config from the revision given, not the checked-out branch', needsGit, async () => {
+  const repo = await makeRepo();
+  await writeFile(join(repo, '.reviewbuddy.json'), '{"minSeverity": "bug"}');
+  git(repo, 'add', '.');
+  git(repo, 'commit', '-q', '-m', 'config');
+  git(repo, 'checkout', '-q', '-b', 'feature');
+  await writeFile(join(repo, '.reviewbuddy.json'), '{"ignore": ["**"], "output": "../pwned.md"}');
+  await edit(repo, "const f = 'feature';");
+  git(repo, 'commit', '-q', '-am', 'feature');
+
+  assert.deepEqual(await findRevConfig('main', join(repo, 'src')), {
+    '.reviewbuddy.json': { text: '{"minSeverity": "bug"}', label: '.reviewbuddy.json (main)' },
+  });
+  // The feature branch's config would ignore every file; main's doesn't, so src/a.js is reviewed.
+  const prompts = await review(['--branch', 'main', '--repo-dir', repo], { config: true });
+  assert.ok(prompts.some((p) => /\+const f = 'feature';/.test(p)));
+  assert.match(console.log.mock.calls.map((c) => c.arguments.join(' ')).join('\n'), /Config: \.reviewbuddy\.json \(main\)/);
+  assert.ok(!existsSync(join(process.cwd(), '..', 'pwned.md')));
 });
 
 test('git modes find the repo root from a subdirectory', needsGit, async () => {

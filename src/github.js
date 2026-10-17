@@ -148,6 +148,21 @@ export async function dismissReview(pr, token, id, message) {
   return response.json();
 }
 
+/**
+ * The login of the user the token belongs to, or null if GitHub doesn't name one: there is no token, or it is
+ * an Actions or GitHub App token, which has no user (GitHub answers 403).
+ */
+export async function getViewerLogin(token) {
+  if (!token) return null;
+  try {
+    const response = await fetchWithRetry(`${API_URL}/user`, { headers: headersFor(token) }, { label: 'GitHub', timeoutMs: TIMEOUT_MS });
+    if (!response.ok) return null;
+    return (await response.json()).login ?? null;
+  } catch {
+    return null;
+  }
+}
+
 const PER_PAGE = 100;
 
 /** GET a list endpoint page by page until a page comes back short, or max items are in. */
@@ -161,15 +176,18 @@ async function listAll(pr, token, path, max = Infinity) {
   }
 }
 
-async function request(pr, token, path, options = {}, retry = {}) {
-  const url = `${API_URL}/repos/${pr.owner}/${pr.repo}/${path}`;
-  const headers = {
+function headersFor(token) {
+  return {
     Accept: 'application/vnd.github+json',
     'User-Agent': 'reviewbuddy',
     'X-GitHub-Api-Version': '2022-11-28',
     ...(token && { Authorization: `Bearer ${token}` }),
-    ...options.headers,
   };
+}
+
+async function request(pr, token, path, options = {}, retry = {}) {
+  const url = `${API_URL}/repos/${pr.owner}/${pr.repo}/${path}`;
+  const headers = { ...headersFor(token), ...options.headers };
 
   let response;
   try {
